@@ -176,18 +176,8 @@
           throw new RuntimeError("unexpected import kind: " + i.kind)
       }
     })
-    // Instantiate the compiled javascript module,
-    // which will give us all the exports.
+    // Instantiate the compiled javascript module, which will give us all the exports.
     this.exports = moduleObject._internals.jsmodule(imports)
-    // XXX TODO: Evaluate the `offset` initializer expression
-    // of every Data and Element Segment, thow RangeError if any
-    // do not fit in their respective Memory or Table.
-    // --
-    // XXX TODO: Apply Data segments to their respective memory.
-    // --
-    // XXX TODO: Apply Element segments to their respective table.
-    // --
-    // XXX TODO: if `start` is present, evaluate it
   }
 
 
@@ -760,7 +750,24 @@
     }
 
     function parseInitExpr() {
-      notImplemented()
+      var e = {}
+      e.op = read_byte()
+      switch (e.op) {
+        case OPCODES.I32_CONST:
+          e.jsexpr = "" + read_varint32()
+          break
+        case OPCODES.GET_GLOBAL:
+          e.value = read_varint32()
+          var index = read_varuint32()
+          e.jsexpr = "g" + index
+          break
+        default:
+          throw new CompileError("Unsupported init expr opcode: " + e.op)
+      }
+      if (read_byte() !== OPCODES.END) {
+        throw new CompileError("Unsupported init expr code")
+      }
+      return e
     }
 
     function parseFileHeader() {
@@ -980,7 +987,48 @@
       }
     }
 
+    function getImportedFunctions() {
+      var imports = sections[SECTIONS.IMPORT] || []
+      var importedFuncs = []
+      imports.forEach(function(i, index) {
+        if (i.kind === EXTERNAL_KINDS.FUNCTION) {
+          importedFuncs.push(index)
+        }
+      })
+      return importedFuncs
+    }
+
+    function getFunctionSignature(index) {
+      var count = 0
+      var imports = sections[SECTIONS.IMPORT] || []
+      imports.forEach(function(i) {
+        if (i.kind === EXTERNAL_KINDS.FUNCTION) {
+          if (index === count) {
+            // It refers to an imported function.
+            return getTypeSignature(i.type)
+          }
+          count++
+        }
+      })
+      // It must refer to a locally-defined function.
+      index -= count
+      var functions = sections[SECTIONS.FUNCTION] || []
+      if (index >= functions.length) {
+        throw new CompileError("Invalid function index: " + index)
+      }
+      return getTypeSignature(functions[index])
+    }
+
+    function getTypeSignature(index) {
+      var typeSection = sections[SECTIONS.TYPE] || []
+      if (index >= typeSection.length) {
+        throw new CompileError("Invalid type index: " + index)
+      }
+      return typeSection[index]
+    }
+
     function parseCodeSection() {
+      var numImportedFunctions = getImportedFunctions().length
       var count = read_varuint32()
       var entries = []
       while (count > 0) {
@@ -988,11 +1036,11 @@
         count--
       }
       return entries
- 
+
       function parseFunctionBody(index) {
         var f = {}
         // XXX TODO: check that the function entry exists
-        f.name = "F" + index
+        f.name = "F" + (index + numImportedFunctions)
         f.sig = sections[SECTIONS.TYPE][sections[SECTIONS.FUNCTION][index]]
         var body_size = read_varuint32()
         var end_of_body_idx = idx + body_size
@@ -1097,6 +1145,7 @@
 
         function pushStackVar(typ) {
           cfStack[cfStack.length - 1].typeStack.push(typ)
+          return getStackVar(typ)
         }
 
         function peekStackType() {
@@ -1167,14 +1216,6 @@
           return cfStack[which]
         }
 
-        function getFunctionSignature(index) {
-          var typeSection = sections[SECTIONS.TYPE] || []
-          if (index >= typeSection.length) {
-            throw new CompileError("Invalid type index: " + index)
-          }
-          return typeSection[index]
-        }
-
         function getLocalType(index) {
           var count = f.sig.param_types.length
           if (index < count) {
@@ -1225,6 +1266,19 @@
           pushLine(getStackVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
         }
 
+        function heapAccess(heap, addr, offset, shift) {
+          return heap + "[(" + addr + "+" + offset + ")>>" + shift + "]"
+        }
+ 
+        function boundsCheck(addr, offset, size) {
+          pushLine("if (" + addr + " + " + (offset + size) + " > memorySize) { return trap() }")
+        }
+
+        function i32_load(expr) {
+          var res = pushStackVar(TYPES.I32)
+          pushLine(res + " = " + expr)
+        }
+
         DECODE: while (true) {
           var op = read_byte()
           switch (op) {
@@ -1269,8 +1323,9 @@
             case OPCODES.END:
               if (cfStack.length === 1) {
                 // End of the entire function.
-                // XXX TODO: check that we're returning something of correct type
-                pushLine("return " + popStackVar())
+                f.sig.return_types.forEach(function(typ) {
+                  pushLine("return " + popStackVar(typ))
+                })
                 break DECODE
               } else {
                 // End of a control block
@@ -1424,7 +1479,7 @@
               if (read_varuint1() !== 0) {
                 throw new CompileError("MVP reserved-value constraint violation")
               }
-              var callSig = getFunctionSignature(type_index)
+              var callSig = getTypeSignature(type_index)
               // XXX TODO: in what order do we pop args, FIFO or LIFO?
               var args = []
               callSig.param_types.forEach(function(typ) {
@@ -1432,8 +1487,8 @@
               })
               // XXX TODO: how to dynamically check call signature?
               // Shall we just always call a stub that does this for us?
-              // Shall weuse asmjs-style signature-specific tables with
-              // placeholders tht trap?
+              // Shall we use asmjs-style signature-specific tables with
+              // placeholders that trap?
               pushLine("TABLE[" + popStackVar(TYPES.I32) + "](" + args.join(",") + ")")
               callSig.return_types.forEach(function(typ) {
                 pushStackVar(type)
@@ -1483,6 +1538,112 @@
               var index = read_varuint32()
               var typ = getGlobalType(index)
               pushLine(getGlobalVar(index, typ) + " = " + popStackVar(typ))
+              break
+
+            case OPCODES.I32_LOAD:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read four individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 2, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 3, 0) + " << 24)"
+                  )
+                  break
+                case 1:
+                  // Partially aligned, read two 16-bit words
+                  i32_load(
+                    heapAccess("HU16", addr, offset, 1) + " | " +
+                    "(" + heapAccess("HU16", addr, offset + 2, 1) + " << 16)"
+                  )
+                  break
+                case 2:
+                  // Natural alignment
+                  i32_load(heapAccess("HI32", addr, offset, 2))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.I64_LOAD:
+              notImplemented()
+              break
+
+            case OPCODES.F32_LOAD:
+              notImplemented()
+              break
+
+            case OPCODES.F64_LOAD:
+              notImplemented()
+              break
+
+            case OPCODES.I32_LOAD8_S:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              i32_load(heapAccess("HI8", addr, offset, 0))
+              break
+
+            case OPCODES.I32_LOAD8_U:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              i32_load(heapAccess("HU8", addr, offset, 0))
+              break
+
+            case OPCODES.I32_LOAD16_S:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read two individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)"
+                  )
+                  // Sign-extend to i32
+                  var res = getStackVar(TYPES.I32)
+                  pushLine("if (" + res + " & 0x8000) { " + res + " |= (-1 << 16) }")
+                  break
+                case 1:
+                  // Natural alignment
+                  i32_load(heapAccess("HI16", addr, offset, 1))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.I32_LOAD16_U:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read two individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)"
+                  )
+                  break
+                case 1:
+                  // Natural alignment
+                  i32_load(heapAccess("HU16", addr, offset, 1))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
               break
 
             case OPCODES.I32_EQZ:
@@ -1618,7 +1779,7 @@
               break
 
             default:
-              throw new CompileError("unsupported opcode: " + op)
+              throw new CompileError("unsupported opcode: 0x" + op.toString(16))
           }
         }
 
@@ -1642,7 +1803,7 @@
       if (d.index !== 0) {
         throw new CompileError("MVP requires data index be zero")
       }
-      d.offset = parseInitExprt()
+      d.offset = parseInitExpr()
       // XXX TODO: assert that initializer yields an i32
       var size = read_varuint32()
       d.data = read_bytes(size)
@@ -1652,7 +1813,7 @@
   }
 
   function renderSectionsToJS(sections) {
-    //console.log("---- RENDERING CODE ----")
+    console.log("---- RENDERING CODE ----")
     var src = []
 
     // Basic setup, helper functions, etc.
@@ -1685,11 +1846,51 @@
     src.push("  return count")
     src.push("}")
 
-    // XXX TODO: declare globals.
+    // XXX TODO: handle the imports
 
-    // XXX TODO: declare memory.
+    var imports = sections[SECTIONS.IMPORT] || []
+    var countFuncs = 0
+    imports.forEach(function(i, idx) {
+      switch (i.kind) {
+        case EXTERNAL_KINDS.FUNCTION:
+          src.push("var F" + countFuncs + " = imports[" + idx + "]")
+          countFuncs++
+          break
+        default:
+          notImplemented()
+      }
+    })
 
     // XXX TODO: declare tables.
+
+    var tables = sections[SECTIONS.TABLE] || []
+    tables.forEach(function(t, idx) {
+      notImplemented()
+    })
+
+    // Create requested memory, and provide views into it.
+
+    var memories = sections[SECTIONS.MEMORY] || []
+    memories.forEach(function(m, idx) {
+      src.push("var M" + idx + " = new WebAssembly.Memory(" + JSON.stringify(m.limits) + ")")
+    })
+
+    if (memories.length > 0) {
+      src.push("var memorySize = M0.buffer.byteLength")
+      src.push("var HI8 = new Int8Array(M0.buffer)")
+      src.push("var HI16 = new Int16Array(M0.buffer)")
+      src.push("var HI32 = new Int32Array(M0.buffer)")
+      src.push("var HU8 = new Uint8Array(M0.buffer)")
+      src.push("var HU16 = new Uint16Array(M0.buffer)")
+      src.push("var HU32 = new Uint32Array(M0.buffer)")
+    }
+
+    // XXX TODO: declare globals.
+
+    var globals = sections[SECTIONS.GLOBAL] || []
+    globals.forEach(function(g, idx) {
+      notImplemented()
+    })
 
     // Render the code for each function.
 
@@ -1700,7 +1901,32 @@
       Array.prototype.push.apply(src, f.code.footer_lines)
     })
 
+    // XXX TODO: handle elements declarations.
+
+    var elements = sections[SECTIONS.ELEMENT] || []
+    elements.forEach(function(e, idx) {
+      notImplemented()
+    })
+
+    // Fill the memory with data from the module.
+    // XXX TODO: bounds checking etc
+
+    var datas = sections[SECTIONS.DATA] || []
+    datas.forEach(function(d, idx) {
+      console.log(d)
+      for (var i = 0; i < d.data.length; i++) {
+        src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
+      }
+    })
+
+    // XXX TODO: run the `start` code if it exists.
+    var start = sections[SECTIONS.START]
+    if (start !== null) {
+      notImplemented()
+    }
+
     // Return the exports as an object.
+
     src.push("return {")
     var exports = sections[SECTIONS.EXPORT] || []
     exports.forEach(function(e, idx) {
@@ -1725,8 +1951,8 @@
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
-    //console.log(code)
-    //console.log("---")
+    console.log(code)
+    console.log("---")
     return new Function('imports', code)
   }
 
@@ -1753,6 +1979,13 @@
 
   function assertIsType(obj, typstr) {
     if (typeof obj !== typstr) {
+      throw new TypeError()
+    }
+  }
+
+  function assertIsCallable(obj) {
+    // XXX TODO: more complicated cases
+    if (typeof obj !== "function" ) {
       throw new TypeError()
     }
   }
