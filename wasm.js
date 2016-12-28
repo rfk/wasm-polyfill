@@ -1116,9 +1116,10 @@
           return name
         }
 
-        function getStackVar() {
+        function getStackVar(typ, pos) {
           var cf = cfStack[cfStack.length - 1]
           var where = cf.typeStack.length - 1
+          where -= (pos || 0)
           if (where < 0) {
             throw new CompileError("stack access outside current block")
           }
@@ -1204,21 +1205,24 @@
           }
         }
 
-        function i32_unaryOp(what) {
+        function i32_unaryOp(what, cast) {
+          cast = cast || "|0"
           var operand = getStackVar(TYPES.I32)
-          pushLine(operand + " = " + what + "(" + operand + ")")
+          pushLine(operand + " = (" + what + "(" + operand + "))" + cast)
         }
 
-        function i32_binaryOp(what) {
-          var lhs = popStackVar(TYPES.I32)
-          var rhs = getStackVar(TYPES.I32)
-          pushLine(rhs + " = " + lhs + " " + what + " " + rhs)
+        function i32_binaryOp(what, cast) {
+          cast = cast || "|0"
+          var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
+          var lhs = "(" + getStackVar(TYPES.I32) + cast + ")"
+          pushLine(getStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")" + cast)
         }
 
-        function i32_binaryFunc(what) {
-          var lhs = popStackVar(TYPES.I32)
-          var rhs = getStackVar(TYPES.I32)
-          pushLine(rhs + " = " + what + "(" + lhs + ", " + rhs + ")")
+        function i32_binaryFunc(what, cast) {
+          cast = cast || "|0"
+          var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
+          var lhs = "(" + getStackVar(TYPES.I32) + cast + ")"
+          pushLine(getStackVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
         }
 
         DECODE: while (true) {
@@ -1499,7 +1503,7 @@
               break
 
             case OPCODES.I32_LT_U:
-              i32_binaryOp("<") // XXX TODO: incorrect
+              i32_binaryOp("<", ">>>0")
               break
 
             case OPCODES.I32_GT_S:
@@ -1507,7 +1511,7 @@
               break
 
             case OPCODES.I32_GT_U:
-              i32_binaryOp(">") // XXX TODO: incorrect
+              i32_binaryOp(">", ">>>0")
               break
 
             case OPCODES.I32_LE_S:
@@ -1515,7 +1519,7 @@
               break
 
             case OPCODES.I32_LE_U:
-              i32_binaryOp("<=") // XXX TODO: incorrect
+              i32_binaryOp("<=", ">>>0")
               break
 
             case OPCODES.I32_GE_S:
@@ -1523,7 +1527,7 @@
               break
 
             case OPCODES.I32_GE_U:
-              i32_binaryOp(">=") // XXX TODO: incorrect
+              i32_binaryOp(">=", ">>>0")
               break
 
             case OPCODES.I32_CLZ:
@@ -1553,19 +1557,32 @@
               break
 
             case OPCODES.I32_DIV_S:
+              var rhs = getStackVar(TYPES.I32)
+              var lhs = getStackVar(TYPES.I32, 1)
+              pushLine("if (" + rhs + " === 0) { return trap() }")
+              pushLine("if (" + lhs + " === INT32_MIN && " + rhs + " === -1) { return trap() }")
               i32_binaryOp("/")
               break
 
             case OPCODES.I32_DIV_U:
-              i32_binaryOp("/")
+              var rhs = getStackVar(TYPES.I32)
+              var lhs = getStackVar(TYPES.I32, 1)
+              pushLine("if (" + rhs + " === 0) { return trap() }")
+              i32_binaryOp("/", ">>>0")
               break
 
             case OPCODES.I32_REM_S:
+              var rhs = getStackVar(TYPES.I32)
+              pushLine("if (" + rhs + " === 0) { return trap() }")
               i32_binaryOp("%")
               break
 
             case OPCODES.I32_REM_U:
-              i32_binaryOp("%")
+              var rhs = getStackVar(TYPES.I32)
+              pushLine("if (" + rhs + " === 0) { return trap() }")
+              i32_binaryOp("%", ">>>0")
+              var res = getStackVar(TYPES.I32)
+              pushLine(res + " = " + res + "|0")
               break
 
             case OPCODES.I32_AND:
@@ -1635,9 +1652,38 @@
   }
 
   function renderSectionsToJS(sections) {
-    console.log("---- RENDERING CODE ----")
+    //console.log("---- RENDERING CODE ----")
     var src = []
+
     // Basic setup, helper functions, etc.
+
+    src.push("var INT32_MIN = 0x80000000|0")
+    src.push("var INT32_MAX = 0x7FFFFFFF|0")
+    src.push("var trap = function() { throw new WebAssembly.RuntimeError() }")
+    src.push("var imul = Math.imul")
+    src.push("var clz = Math.clz32")
+    src.push("var rotl = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}")
+    src.push("var rotr = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}")
+    src.push("var ctz = function(v) {")
+    src.push("  v = v|0")
+    src.push("  var count = 0")
+    src.push("  var bit = 0x01")
+    src.push("  while (bit && (v & bit) === 0) {")
+    src.push("    count++")
+    src.push("    bit = (bit << 1) & 0xFFFFFFFF")
+    src.push("  }")
+    src.push("  return count")
+    src.push("}")
+    src.push("var popcnt = function(v) {")
+    src.push("  v = v|0")
+    src.push("  var count = 0")
+    src.push("  var bit = 0x01")
+    src.push("  while (bit) {")
+    src.push("    if (v & bit) { count++ }")
+    src.push("    bit = (bit << 1) & 0xFFFFFFFF")
+    src.push("  }")
+    src.push("  return count")
+    src.push("}")
 
     // XXX TODO: declare globals.
 
@@ -1678,9 +1724,8 @@
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
-    console.log("---")
-    console.log(code)
-    console.log("---")
+    //console.log(code)
+    //console.log("---")
     return new Function('imports', code)
   }
 
