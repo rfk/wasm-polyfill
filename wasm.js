@@ -1693,7 +1693,8 @@
 
     // Render the code for each function.
 
-    sections[SECTIONS.CODE].forEach(function(f, idx) {
+    var code = sections[SECTIONS.CODE] || []
+    code.forEach(function(f, idx) {
       Array.prototype.push.apply(src, f.code.header_lines)
       Array.prototype.push.apply(src, f.code.body_lines)
       Array.prototype.push.apply(src, f.code.footer_lines)
@@ -1701,7 +1702,7 @@
 
     // Return the exports as an object.
     src.push("return {")
-    var exports = sections[SECTIONS.EXPORT]
+    var exports = sections[SECTIONS.EXPORT] || []
     exports.forEach(function(e, idx) {
       var ref = "trap()"
       switch (e.kind) {
