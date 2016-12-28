@@ -318,6 +318,7 @@
   //
 
   var TYPES = {
+    UNKNOWN: 0x00,
     I32: -0x01,
     I64: -0x02,
     F32: -0x03,
@@ -659,6 +660,20 @@
       notImplemented()
     }
 
+    function read_f32() {
+      var dv = new DataView(bytes.buffer)
+      var v = dv.getFloat32(idx, true)
+      idx += 4
+      return v
+    }
+
+    function read_f64() {
+      var dv = new DataView(bytes.buffer)
+      var v = dv.getFloat64(idx, true)
+      idx += 8
+      return v
+    }
+
     function read_value_type() {
       var v = read_varint7()
       if (v >= 0 || v < TYPES.F64) {
@@ -802,6 +817,9 @@
           throw new CompileError("read past end of section")
         }
         idx = next_section_idx
+      }
+      while (sections.length <= SECTIONS.DATA) {
+        sections.push(null)
       }
       if (idx !== bytes.length) {
         throw new CompileError("unepected end of bytes")
@@ -1072,6 +1090,7 @@
       // not least because that doesn't support growable memory anyway.
 
       function parseFunctionCode(f) {
+        //try {
         var c = {
           numvars_local_i32: 0,
           numvars_local_f32: 0,
@@ -1105,7 +1124,7 @@
         function printStack() {
           console.log("--")
           for (var i = cfStack.length - 1; i >= 0; i--) {
-            console.log(cfStack[i].typeStack)
+            console.log(cfStack[i].polymorphic ? "*" : "-", cfStack[i].typeStack)
           }
           console.log("--")
         }
@@ -1124,9 +1143,18 @@
             sig: sig,
             index: cfStack.length,
             label: "L" + cfStack.length,
+            polymorphic: false,
+            endReached: false,
             typeStack: [],
             prevStackHeights: prevStackHeights
           })
+          return cfStack[cfStack.length - 1]
+        }
+
+        function goPolymorphic() {
+          var cf = cfStack[cfStack.length - 1]
+          cf.polymorphic = true
+          cf.typeStack = []
         }
 
         function popControlFlow() {
@@ -1135,6 +1163,7 @@
         }
 
         function pushLine(ln, indent) {
+          if (deadCodeZone) { return }
           var indent = cfStack.length + (indent || 0) + 1
           while (indent > 0) {
             ln = "  " + ln
@@ -1170,7 +1199,10 @@
           var where = cf.typeStack.length - 1
           where -= (pos || 0)
           if (where < 0) {
-            throw new CompileError("stack access outside current block")
+            if (! cf.polymorphic) {
+              throw new CompileError("stack access outside current block")
+            }
+            return "UNREACHABLE"
           }
           var typ = cf.typeStack[where]
           var height = cf.prevStackHeights[typ]
@@ -1195,8 +1227,8 @@
           if (cf.sig === TYPES.NONE) {
             throw new CompileError("No output from void block")
           }
-          var height = cf.prevStackHeights[cf.sig] + 1
-          switch (typ) {
+          var height = cf.prevStackHeights[cf.sig]
+          switch (cf.sig) {
             case TYPES.I32:
               return "si" + height
             case TYPES.F32:
@@ -1255,15 +1287,21 @@
         function i32_binaryOp(what, cast) {
           cast = cast || "|0"
           var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
-          var lhs = "(" + getStackVar(TYPES.I32) + cast + ")"
-          pushLine(getStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")" + cast)
+          var lhs = "(" + popStackVar(TYPES.I32) + cast + ")"
+          pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")" + cast)
         }
 
         function i32_binaryFunc(what, cast) {
           cast = cast || "|0"
           var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
-          var lhs = "(" + getStackVar(TYPES.I32) + cast + ")"
-          pushLine(getStackVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
+          var lhs = "(" + popStackVar(TYPES.I32) + cast + ")"
+          pushLine(pushStackVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
+        }
+
+        function f32_compareOp(what) {
+          var rhs = popStackVar(TYPES.F32)
+          var lhs = popStackVar(TYPES.F32)
+          pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")|0")
         }
 
         function heapAccess(heap, addr, offset, shift) {
@@ -1279,12 +1317,15 @@
           pushLine(res + " = " + expr)
         }
 
+        var deadCodeZone = false
+
         DECODE: while (true) {
           var op = read_byte()
           switch (op) {
 
             case OPCODES.UNREACHABLE:
-              pushLine("trap()")
+              pushLine("return trap()")
+              deadCodeZone = true
               break
 
             case OPCODES.NOP:
@@ -1313,9 +1354,13 @@
               // left precisely one value, of correct type, on the stack.
               // The push/pop here resets stack state between the two branches.
               var cf = popControlFlow()
+              if (! deadCodeZone) {
+                cf.endReached = true
+              }
               if (cf.op !== OPCODES.IF) {
                 throw new CompileError("ELSE outside of IF")
               }
+              deadCodeZone = false
               pushLine("} else {")
               pushControlFlow(cf.op, cf.sig)
               break
@@ -1323,13 +1368,36 @@
             case OPCODES.END:
               if (cfStack.length === 1) {
                 // End of the entire function.
+                deadCodeZone = false
                 f.sig.return_types.forEach(function(typ) {
                   pushLine("return " + popStackVar(typ))
                 })
                 break DECODE
               } else {
                 // End of a control block
-                var cf = popControlFlow()
+                var cf = cfStack[cfStack.length - 1]
+                if (! deadCodeZone) {
+                  cf.endReached = true
+                } else if (cf.endReached && cf.sig !== TYPES.NONE) {
+                  // We're reached by a branch, but not by fall-through,
+                  // so there's not going to be an entry on the stack.
+                  // Make one.
+                  pushStackVar(cf.sig)
+                }
+                if (cf.sig !== TYPES.NONE && cf.endReached) {
+                  var output = getStackVar(cf.sig)
+                } else {
+                  if (cf.typeStack.length > 0) {
+                    throw new CompileError("void block left values on the stack")
+                  }
+                }
+                popControlFlow()
+                deadCodeZone = false
+                // Only push block result if *something* reaches the end
+                // of the block.  Otherwise, we remain in dead code mode.
+                if (cf.sig !== TYPES.NONE && cf.endReached) {
+                  pushLine("  " + pushStackVar(cf.sig) + " = " + output)
+                }
                 switch (cf.op) {
                   case OPCODES.BLOCK:
                     pushLine("} while(0)")
@@ -1343,10 +1411,9 @@
                   default:
                     throw new CompileError("Popped an unexpected control op")
                 }
-                if (cf.sig !== TYPES.NONE) {
-                  // XXX TODO: sanity-check that we left a single value of the
-                  // correct type on the stack
-                  pushStackVar(cf.sig)
+                if (! cf.endReached) {
+                  goPolymorphic()
+                  deadCodeZone = true
                 }
               }
               break
@@ -1357,6 +1424,7 @@
               switch (cf.op) {
                 case OPCODES.BLOCK:
                 case OPCODES.IF:
+                  cf.endReached = true
                   if (cf.sig !== TYPES.NONE) {
                     var resultVar = popStackVar(cf.sig)
                     var outputVar = getBlockOutputVar(cf)
@@ -1372,6 +1440,8 @@
                 default:
                   throw new CompileError("Branch to unsupported opcode")
               }
+              goPolymorphic()
+              deadCodeZone = true
               break
 
             case OPCODES.BR_IF:
@@ -1380,9 +1450,11 @@
               switch (cf.op) {
                 case OPCODES.BLOCK:
                 case OPCODES.IF:
+                  cf.endReached = true
                   pushLine("if (" + popStackVar(TYPES.I32) + ") {")
                   if (cf.sig !== TYPES.NONE) {
-                    var resultVar = popStackVar(cf.sig)
+                    // This is left on the stack if condition is not true.
+                    var resultVar = getStackVar(cf.sig)
                     var outputVar = getBlockOutputVar(cf)
                     if (outputVar !== resultVar) {
                       pushLine("  " + outputVar + " = " + resultVar)
@@ -1406,6 +1478,7 @@
               var targets = []
               while (count > 0) {
                 targets.push(read_varuint32())
+                count--
               }
               var default_target = read_varuint32()
               var default_cf = getBranchTarget(default_target)
@@ -1416,9 +1489,10 @@
               if (default_cf.sig !== TYPES.NONE) {
                 resultVar = popStackVar(default_cf.sig)
               }
-              targets.forEach(function(target) {
-                pushLine("  case " + target + ":")
+              targets.forEach(function(target, targetNum) {
+                pushLine("  case " + targetNum + ":")
                 var cf = getBranchTarget(target)
+                cf.endReached = true
                 if (cf.sig !== TYPES.NONE) {
                   var outputVar = getBlockOutputVar(cf)
                   if (outputVar !== resultVar) {
@@ -1442,6 +1516,7 @@
                   pushLine("    " + outputVar + " = " + resultVar)
                 }
               }
+              default_cf.endReached = true
               switch (default_cf.op) {
                 case OPCODES.BLOCK:
                 case OPCODES.IF:
@@ -1452,12 +1527,15 @@
                   break
               }
               pushLine("}")
-              notImplemented()
+              goPolymorphic()
+              deadCodeZone = true
               break
 
-            case OPCODES.BR_RETURN:
+            case OPCODES.RETURN:
               // XXX TODO: check that we're returning something of correct type
               pushLine("return " + popStackVar())
+              goPolymorphic()
+              deadCodeZone = true
               break
 
             case OPCODES.CALL:
@@ -1496,7 +1574,7 @@
               break
 
             case OPCODES.DROP:
-              popStackVar()
+              popStackVar(TYPES.UNKNOWN)
               break
 
             case OPCODES.SELECT:
@@ -1646,6 +1724,22 @@
               }
               break
 
+            case OPCODES.I32_CONST:
+              pushLine(pushStackVar(TYPES.I32) + " = " + read_varint32())
+              break
+
+            case OPCODES.I64_CONST:
+              throw new CompileError("i64 support not implemented yet")
+              break
+
+            case OPCODES.F32_CONST:
+              pushLine(pushStackVar(TYPES.F32) + " = " + read_f32())
+              break
+
+            case OPCODES.F64_CONST:
+              pushLine(pushStackVar(TYPES.F64) + " = " + read_f64())
+              break
+
             case OPCODES.I32_EQZ:
               var operand = getStackVar(TYPES.I32)
               pushLine(operand + " = (" + operand + " === 0)|0")
@@ -1689,6 +1783,30 @@
 
             case OPCODES.I32_GE_U:
               i32_binaryOp(">=", ">>>0")
+              break
+
+            case OPCODES.F32_EQ:
+              f32_compareOp("===")
+              break
+
+            case OPCODES.F32_NE:
+              f32_compareOp("!==")
+              break
+
+            case OPCODES.F32_LT:
+              f32_compareOp("<")
+              break
+
+            case OPCODES.F32_GT:
+              f32_compareOp(">")
+              break
+
+            case OPCODES.F32_LE:
+              f32_compareOp("<=")
+              break
+
+            case OPCODES.F32_GE:
+              f32_compareOp(">=")
               break
 
             case OPCODES.I32_CLZ:
@@ -1782,8 +1900,16 @@
               throw new CompileError("unsupported opcode: 0x" + op.toString(16))
           }
         }
+        //pushLine("// compiled successfully")
 
         return c
+        //}
+        //finally {
+        //  console.log("---") 
+        //  console.log(f.name)
+        //  console.log(c.body_lines.join("\n"))
+        //  console.log("---") 
+        //}
       }
     }
 
@@ -1813,7 +1939,7 @@
   }
 
   function renderSectionsToJS(sections) {
-    console.log("---- RENDERING CODE ----")
+    //console.log("---- RENDERING CODE ----")
     var src = []
 
     // Basic setup, helper functions, etc.
@@ -1913,7 +2039,6 @@
 
     var datas = sections[SECTIONS.DATA] || []
     datas.forEach(function(d, idx) {
-      console.log(d)
       for (var i = 0; i < d.data.length; i++) {
         src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
       }
@@ -1922,7 +2047,7 @@
     // XXX TODO: run the `start` code if it exists.
     var start = sections[SECTIONS.START]
     if (start !== null) {
-      notImplemented()
+      src.push("F" + start + "()")
     }
 
     // Return the exports as an object.
@@ -1951,8 +2076,8 @@
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
-    console.log(code)
-    console.log("---")
+    //console.log(code)
+    //console.log("---")
     return new Function('imports', code)
   }
 
