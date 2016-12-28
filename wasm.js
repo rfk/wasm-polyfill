@@ -995,7 +995,7 @@
         }
         e.offset = parseInitExpr()
         // XXX TODO: check tht initExpr is i32
-        var num_elem = read_varuint32()
+        var num_elems = read_varuint32()
         e.elems = []
         while (num_elems > 0) {
           e.elems.push(read_varuint32())
