@@ -1244,9 +1244,13 @@
 
         function popStackVar(wantType) {
           var name = getStackVar()
-          var typ = cfStack[cfStack.length - 1].typeStack.pop()
+          var cf = cfStack[cfStack.length - 1]
+          var typ = cf.typeStack.pop()
           if (wantType && typ !== wantType) {
-            throw new CompileError("Stack type mismatch")
+            if (! cf.polymorphic) {
+              throw new CompileError("Stack type mismatch: expected, " + wantType + ", found " + typ)
+            }
+            return "UNDEFINED"
           }
           return name
         }
@@ -1399,6 +1403,29 @@
           var rhs = popStackVar(TYPES.F32)
           var lhs = popStackVar(TYPES.F32)
           pushLine(pushStackVar(TYPES.F32) + " = ToF32(" + what + "(" + lhs + ", " + rhs + "))")
+        }
+
+        function f64_compareOp(what) {
+          var rhs = popStackVar(TYPES.F64)
+          var lhs = popStackVar(TYPES.F64)
+          pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")|0")
+        }
+
+        function f64_unaryOp(what) {
+          var operand = popStackVar(TYPES.F64)
+          pushLine(pushStackVar(TYPES.F64) + " = " + what +"(" + operand + ")")
+        }
+
+        function f64_binaryOp(what) {
+          var rhs = popStackVar(TYPES.F64)
+          var lhs = popStackVar(TYPES.F64)
+          pushLine(pushStackVar(TYPES.F64) + " = " + lhs + " " + what + " " + rhs)
+        }
+
+        function f64_binaryFunc(what) {
+          var rhs = popStackVar(TYPES.F64)
+          var lhs = popStackVar(TYPES.F64)
+          pushLine(pushStackVar(TYPES.F64) + " = " + what + "(" + lhs + ", " + rhs + ")")
         }
 
         function heapAccess(heap, addr, offset, shift) {
@@ -1960,6 +1987,30 @@
               f32_compareOp(">=")
               break
 
+            case OPCODES.F64_EQ:
+              f64_compareOp("===")
+              break
+
+            case OPCODES.F64_NE:
+              f64_compareOp("!==")
+              break
+
+            case OPCODES.F64_LT:
+              f64_compareOp("<")
+              break
+
+            case OPCODES.F64_GT:
+              f64_compareOp(">")
+              break
+
+            case OPCODES.F64_LE:
+              f64_compareOp("<=")
+              break
+
+            case OPCODES.F64_GE:
+              f64_compareOp(">=")
+              break
+
             case OPCODES.I32_CLZ:
               i32_unaryOp("i32_clz")
               break
@@ -2183,10 +2234,72 @@
               f32_binaryFunc("f32_copysign")
               break
 
+            case OPCODES.F64_ABS:
+              f64_unaryOp("f64_abs")
+              break
+
+            case OPCODES.F64_NEG:
+              f64_unaryOp("f64_neg")
+              break
+
+            case OPCODES.F64_CEIL:
+              f64_unaryOp("f64_ceil")
+              break
+
+            case OPCODES.F64_FLOOR:
+              f64_unaryOp("f64_floor")
+              break
+
+            case OPCODES.F64_TRUNC:
+              f64_unaryOp("f64_trunc")
+              break
+
+            case OPCODES.F64_NEAREST:
+              f64_unaryOp("f64_nearest")
+              break
+
+            case OPCODES.F64_SQRT:
+              f64_unaryOp("f64_sqrt")
+              break
+
+            case OPCODES.F64_ADD:
+              f64_binaryOp("+")
+              break
+
+            case OPCODES.F64_SUB:
+              f64_binaryOp("-")
+              break
+
+            case OPCODES.F64_MUL:
+              f64_binaryOp("*")
+              break
+
+            case OPCODES.F64_DIV:
+              f64_binaryOp("/")
+              break
+
+            case OPCODES.F64_MIN:
+              f64_binaryFunc("f64_min")
+              break
+
+            case OPCODES.F64_MAX:
+              f64_binaryFunc("f64_max")
+              break
+
+            case OPCODES.F64_COPYSIGN:
+              f64_binaryFunc("f64_copysign")
+              break
+
             case OPCODES.I32_REINTERPRET_F32:
               var operand = popStackVar(TYPES.F32)
               var output = pushStackVar(TYPES.I32)
               pushLine(output + " = ToF32(" + operand + ")|0")
+              break
+
+            case OPCODES.I64_REINTERPRET_F64:
+              var operand = popStackVar(TYPES.F64)
+              var output = pushStackVar(TYPES.I64)
+              pushLine(output + " = i64_reinterpret_f64(" + operand + ")")
               break
 
             default:
@@ -2439,12 +2552,17 @@
   stdlib.i64_popcnt = function(v) {
     return Long.fromNumber(stdlib.i32_popcnt(v.getHighBits()) + stdlib.i32_popcnt(v.getLowBits()))
   }
+  stdlib.i64_reinterpret_f64 = function(v) {
+    scratchData.setFloat64(0, v, true)
+    var low = scratchData.getInt32(0, true)
+    var high = scratchData.getInt32(4, true)
+    return new Long(low, high)
+  }
 
   // f32 operations
   stdlib.ToF32 = Math.fround
   stdlib.f32_min = Math.min
   stdlib.f32_max = Math.max
-  stdlib.f32_abs = Math.abs
   stdlib.f32_sqrt = Math.sqrt
   stdlib.f32_floor = Math.floor
   stdlib.f32_ceil = Math.ceil
@@ -2454,14 +2572,79 @@
     if (Math.abs(v - Math.trunc(v)) === 0.5) { return 2 * Math.round(v / 2) }
     return Math.round(v)
   }
+  stdlib.f32_abs = function (v) {
+    if (isNaN(v)) {
+      scratchData.setFloat32(0, v, true)
+      scratchBytes[3] &= ~0x80
+      return scratchData.getFloat32(0, true)
+    }
+    return Math.abs(v)
+  }
   stdlib.f32_signof = function(v) {
-    if (isNaN) {
+    if (isNaN(v)) {
       scratchData.setFloat32(0, v, true)
       return (scratchBytes[3] & 0x80) ? -1 : 1
     }
-    return (y > 0 || 1 / y > 0) ? 1 : -1
+    return (v > 0 || 1 / v > 0) ? 1 : -1
   }
   stdlib.f32_copysign = function (x, y) {
+    if (isNaN(x)) {
+      scratchData.setFloat32(0, x, true)
+      if (stdlib.f32_signof(y) === -1) {
+        scratchBytes[3] |= 0x80
+      } else {
+        scratchBytes[3] &= ~0x80
+      }
+      return scratchData.getFloat32(0, true)
+    }
+    return stdlib.f32_signof(y) * Math.abs(x)
+  }
+
+  // f64 operations
+  stdlib.f64_min = Math.min
+  stdlib.f64_max = Math.max
+  stdlib.f64_sqrt = Math.sqrt
+  stdlib.f64_floor = Math.floor
+  stdlib.f64_ceil = Math.ceil
+  stdlib.f64_trunc = Math.trunc
+  stdlib.f64_nearest = stdlib.f32_nearest
+  stdlib.f64_abs = function (v) {
+    if (isNaN(v)) {
+      scratchData.setFloat64(0, v, true)
+      scratchBytes[7] &= ~0x80
+      return scratchData.getFloat64(0, true)
+    }
+    return Math.abs(v)
+  }
+  stdlib.f64_neg = function (v) {
+    if (isNaN(v)) {
+      scratchData.setFloat64(0, v, true)
+      if (scratchBytes[7] & 0x80) {
+        scratchBytes[7] &= ~0x80
+      } else {
+        scratchBytes[7] |= 0x80
+      }
+      return scratchData.getFloat64(0, true)
+    }
+    return -v
+  }
+  stdlib.f64_signof = function(v) {
+    if (isNaN(v)) {
+      scratchData.setFloat64(0, v, true)
+      return (scratchBytes[7] & 0x80) ? -1 : 1
+    }
+    return (v > 0 || 1 / v > 0) ? 1 : -1
+  }
+  stdlib.f64_copysign = function (x, y) {
+    if (isNaN(x)) {
+      scratchData.setFloat64(0, x, true)
+      if (stdlib.f64_signof(y) === -1) {
+        scratchBytes[7] |= 0x80
+      } else {
+        scratchBytes[7] &= ~0x80
+      }
+      return scratchData.getFloat64(0, true)
+    }
     return stdlib.f32_signof(y) * Math.abs(x)
   }
 
