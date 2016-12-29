@@ -264,10 +264,10 @@
   function Table(tableDescriptor) {
     assertIsDefined(this)
     assertIsType(tableDescriptor, "object")
-    var element = tableDescriptor.element
-    if (element !== "anyfunc") {
-      throw new TypeError()
-    }
+    //var element = tableDescriptor.element
+    //if (element !== "anyfunc") {
+    //  throw new TypeError()
+    //}
     var initial = ToNonWrappingUint32(tableDescriptor.initial)
     var maximum = null
     if (tableDescriptor.hasOwnProperty("maximum")) {
@@ -1151,7 +1151,7 @@
       // not least because that doesn't support growable memory anyway.
 
       function parseFunctionCode(f) {
-        //try {
+        try {
         var c = {
           header_lines: ["function " + f.name + "(" + makeParamList() + ") {"],
           body_lines: [],
@@ -1220,7 +1220,7 @@
         }
 
         function pushLine(ln, indent) {
-          if (deadCodeZone) { return }
+          //if (deadCodeZone) { return }
           var indent = cfStack.length + (indent || 0) + 1
           while (indent > 0) {
             ln = "  " + ln
@@ -1235,9 +1235,13 @@
         }
 
         function peekStackType() {
-          var stack = cfStack[cfStack.length - 1].typeStack
+          var cf = cfStack[cfStack.length - 1]
+          var stack = cf.typeStack
           if (stack.length === 0) {
-            throw new CompileError("nothing on the stack")
+            if (! cf.polymorphic) {
+              throw new CompileError("nothing on the stack")
+            }
+            return TYPES.UNKNOWN
           }
           return stack[stack.length - 1]
         }
@@ -1281,8 +1285,10 @@
               return "sf" + height
             case TYPES.F64:
               return "sd" + height
+            case TYPES.UNKNOWN:
+              return "UNREACHABLE"
             default:
-              throw new CompileError("unexpected type on stack")
+              throw new CompileError("unexpected type on stack: " + typ)
           }
         }
 
@@ -1441,6 +1447,38 @@
           pushLine(res + " = " + expr)
         }
 
+        function f32_load(expr) {
+          var res = pushStackVar(TYPES.F32)
+          pushLine(res + " = " + expr)
+        }
+
+        function f32_loadFromI32(expr) {
+          var res = pushStackVar(TYPES.F32)
+          pushLine(res + " = f32_reinterpret_i32(" + expr + ")")
+        }
+
+        function i64_from_i32_s() {
+          var low32 = popStackVar(TYPES.I32)
+          pushLine(pushStackVar(TYPES.I64) + " = new Long(" + low32 + ", 0)")
+        }
+
+        function i64_from_i32_u() {
+          var low32 = popStackVar(TYPES.I32)
+          pushLine(pushStackVar(TYPES.I64) + " = new Long(" + low32 + ", 0, true)")
+        }
+
+        function i64_from_i32x2_s() {
+          var high32 = popStackVar(TYPES.I32)
+          var low32 = popStackVar(TYPES.I32)
+          pushLine(pushStackVar(TYPES.I64) + " = new Long(" + low32 + ", " + high32 + ")")
+        }
+
+        function i64_from_i32x2_u() {
+          var high32 = popStackVar(TYPES.I32)
+          var low32 = popStackVar(TYPES.I32)
+          pushLine(pushStackVar(TYPES.I64) + " = new Long(" + low32 + ", " + high32 + ", true)")
+        }
+
         var deadCodeZone = false
 
         DECODE: while (true) {
@@ -1469,8 +1507,9 @@
 
             case OPCODES.IF:
               var sig = read_block_type()
-              pushControlFlow(op, sig)
-              pushLine("if (" + popStackVar(TYPES.I32) + ") { " + cfStack.label + ": do {", -1)
+              var cond = popStackVar(TYPES.I32)
+              var cf = pushControlFlow(op, sig)
+              pushLine("if (" + cond + ") { " + cf.label + ": do {", -1)
               break
 
             case OPCODES.ELSE:
@@ -1484,8 +1523,9 @@
               if (cf.op !== OPCODES.IF) {
                 throw new CompileError("ELSE outside of IF")
               }
+              // XXX TODO: don't emit the `else` if the entire `if` was dead code
               deadCodeZone = false
-              pushLine("} else {")
+              pushLine("} while (0) } else { "+ cf.label + ": do{")
               pushControlFlow(cf.op, cf.sig)
               break
 
@@ -1508,11 +1548,13 @@
                   // Make one.
                   pushStackVar(cf.sig)
                 }
-                if (cf.sig !== TYPES.NONE && cf.endReached) {
-                  var output = getStackVar(cf.sig)
-                } else {
-                  if (cf.typeStack.length > 0) {
-                    throw new CompileError("void block left values on the stack")
+                if (cf.endReached) {
+                  if (cf.sig !== TYPES.NONE) {
+                    var output = getStackVar(cf.sig)
+                  } else {
+                    if (cf.typeStack.length > 0) {
+                      throw new CompileError("void block left values on the stack")
+                    }
                   }
                 }
                 popControlFlow()
@@ -1700,7 +1742,7 @@
               // placeholders that trap?
               pushLine("TABLE[" + popStackVar(TYPES.I32) + "](" + args.join(",") + ")")
               callSig.return_types.forEach(function(typ) {
-                pushStackVar(type)
+                pushStackVar(typ)
               })
               break
 
@@ -1781,11 +1823,83 @@
               break
 
             case OPCODES.I64_LOAD:
-              notImplemented()
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              // Need two i32 vars, so create a temp one.
+              pushStackVar(TYPES.I32)
+              var addrDup = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              pushLine(addrDup + " = " + addr)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read eight individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 2, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 3, 0) + " << 24)"
+                  )
+                  i32_load(
+                    heapAccess("HU8", addrDup, offset + 4, 0) + " | " +
+                    "(" + heapAccess("HU8", addrDup, offset + 5, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addrDup, offset + 6, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addrDup, offset + 7, 0) + " << 24)"
+                  )
+                  break
+                case 1:
+                  // Partially aligned, read four 16-bit words
+                  i32_load(
+                    heapAccess("HU16", addr, offset, 1) + " | " +
+                    "(" + heapAccess("HU16", addr, offset + 2, 1) + " << 16)"
+                  )
+                  i32_load(
+                    heapAccess("HU16", addrDup, offset + 4, 1) + " | " +
+                    "(" + heapAccess("HU16", addrDup, offset + 6, 1) + " << 16)"
+                  )
+                  break
+                case 2:
+                case 3:
+                  // As naturally aligned as we can get, read two 32-bit words
+                  i32_load(heapAccess("HU32", addr, offset, 2))
+                  i32_load(heapAccess("HU32", addrDup, offset + 4, 2))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              i64_from_i32x2_u()
               break
 
             case OPCODES.F32_LOAD:
-              notImplemented()
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read four individual bytes and reconstruct
+                  f32_loadFromI32(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 2, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 3, 0) + " << 24)"
+                  )
+                  break
+                case 1:
+                  // Partially aligned, read two 16-bit words and reconstruct
+                  f32_loadFromI32(
+                    heapAccess("HU16", addr, offset, 1) + " | " +
+                    "(" + heapAccess("HU16", addr, offset + 2, 1) + " << 16)"
+                  )
+                  break
+                case 2:
+                  // Natural alignment, read it directly.
+                  f32_load(heapAccess("HF32", addr, offset, 2))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
               break
 
             case OPCODES.F64_LOAD:
@@ -1853,6 +1967,350 @@
                 default:
                   throw new CompileError("unsupported load flags")
               }
+              break
+
+            case OPCODES.I64_LOAD8_S:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              i32_load(heapAccess("HI8", addr, offset, 0))
+              i64_from_i32_s()
+              break
+
+            case OPCODES.I64_LOAD8_U:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              i32_load(heapAccess("HU8", addr, offset, 0))
+              i64_from_i32_u()
+              break
+
+            case OPCODES.I64_LOAD16_S:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read two individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)"
+                  )
+                  // Sign-extend to i32
+                  var res = getStackVar(TYPES.I32)
+                  pushLine("if (" + res + " & 0x8000) { " + res + " |= (-1 << 16) }")
+                  break
+                case 1:
+                  // Natural alignment
+                  i32_load(heapAccess("HI16", addr, offset, 1))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              i64_from_i32_s()
+              break
+
+            case OPCODES.I64_LOAD16_U:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read two individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)"
+                  )
+                  break
+                case 1:
+                  // Natural alignment
+                  i32_load(heapAccess("HU16", addr, offset, 1))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              i64_from_i32_u()
+              break
+
+            case OPCODES.I64_LOAD32_S:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read four individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 2, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 3, 0) + " << 24)"
+                  )
+                  break
+                case 1:
+                  // Partially aligned, read two 16-bit words
+                  i32_load(
+                    heapAccess("HU16", addr, offset, 1) + " | " +
+                    "(" + heapAccess("HU16", addr, offset + 2, 1) + " << 16)"
+                  )
+                  break
+                case 2:
+                  // Naturally aligned, read directly
+                  i32_load(heapAccess("HI32", addr, offset, 2))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              i64_from_i32_s()
+              break
+
+            case OPCODES.I64_LOAD32_U:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, read four individual bytes
+                  i32_load(
+                    heapAccess("HU8", addr, offset, 0) + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 1, 0) + " << 8)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 2, 0) + " << 16)" + " | " +
+                    "(" + heapAccess("HU8", addr, offset + 3, 0) + " << 24)"
+                  )
+                  break
+                case 1:
+                  // Partially aligned, read two 16-bit words
+                  i32_load(
+                    heapAccess("HU16", addr, offset, 1) + " | " +
+                    "(" + heapAccess("HU16", addr, offset + 2, 1) + " << 16)"
+                  )
+                  break
+                case 2:
+                  // Naturally aligned, read directly
+                  i32_load(heapAccess("HI32", addr, offset, 2))
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              i64_from_i32_u()
+              break
+
+            case OPCODES.I32_STORE:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, write four individual bytes
+                  pushLine(heapAccess("HU8", addr, offset, 0) + " = " + value + " & 0xFF")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = (" + value + " & 0xFF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 2, 0) + " = (" + value + " & 0xFF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 3, 0) + " = (" + value + " & 0xFF000000) >>> 24")
+                  break
+                case 1:
+                  // Partially aligned, write two 16-bit words
+                  pushLine(heapAccess("HU16", addr, offset, 1) + " = " + value + " & 0xFFFF")
+                  pushLine(heapAccess("HU16", addr, offset + 2, 1) + " = (" + value + " & 0xFFFF0000) >>> 16")
+                  break
+                case 2:
+                  // Natural alignment
+                  pushLine(heapAccess("HU32", addr, offset, 2) + " = " + value)
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.I64_STORE:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I64)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 8)
+              switch (flags) {
+                case 0:
+                  // Unaligned, write eight individual bytes
+                  pushLine(heapAccess("HU8", addr, offset + 0, 0) + " = ((" + value + ".low) & 0x000000FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = ((" + value + ".low) & 0x0000FF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 2, 0) + " = ((" + value + ".low) & 0x00FF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 3, 0) + " = ((" + value + ".low) & 0xFF000000) >>> 24")
+                  pushLine(heapAccess("HU8", addr, offset + 4, 0) + " = ((" + value + ".high) & 0x000000FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 5, 0) + " = ((" + value + ".high) & 0x0000FF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 6, 0) + " = ((" + value + ".high) & 0x00FF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 7, 0) + " = ((" + value + ".high) & 0xFF000000) >>> 24")
+                  break
+                case 1:
+                  // Partially aligned, write four 16-bit words
+                  pushLine(heapAccess("HU16", addr, offset + 0, 1) + " = ((" + value + ".low) & 0x0000FFFF) >>> 0")
+                  pushLine(heapAccess("HU16", addr, offset + 2, 1) + " = ((" + value + ".low) & 0xFFFF0000) >>> 16")
+                  pushLine(heapAccess("HU16", addr, offset + 4, 1) + " = ((" + value + ".high) & 0x0000FFFF) >>> 0")
+                  pushLine(heapAccess("HU16", addr, offset + 6, 1) + " = ((" + value + ".high) & 0xFFFF0000) >>> 16")
+                  break
+                case 2:
+                case 3:
+                  // As natural as we can get, write two 32-bit words
+                  pushLine(heapAccess("HU32", addr, offset + 0, 2) + " = " + value + ".low")
+                  pushLine(heapAccess("HU32", addr, offset + 4, 2) + " = " + value + ".high")
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.F32_STORE:
+              notImplemented()
+              break
+
+            case OPCODES.F64_STORE:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.F64)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 8)
+              switch (flags) {
+                case 0:
+                  // Unaligned, convert to i64 and write it out.
+                  i64_from_f64(value)
+                  value = popStackVar(TYPES.I64)
+                  pushLine(heapAccess("HU8", addr, offset + 0, 0) + " = ((" + value + ".low) & 0x000000FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = ((" + value + ".low) & 0x0000FF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 2, 0) + " = ((" + value + ".low) & 0x00FF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 3, 0) + " = ((" + value + ".low) & 0xFF000000) >>> 24")
+                  pushLine(heapAccess("HU8", addr, offset + 4, 0) + " = ((" + value + ".high) & 0x000000FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 5, 0) + " = ((" + value + ".high) & 0x0000FF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 6, 0) + " = ((" + value + ".high) & 0x00FF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 7, 0) + " = ((" + value + ".high) & 0xFF000000) >>> 24")
+                  break
+                case 1:
+                  // Partially aligned, convert to i64 and write it out.
+                  i64_from_f64(value)
+                  value = popStackVar(TYPES.I64)
+                  pushLine(heapAccess("HU16", addr, offset + 0, 1) + " = ((" + value + ".low) & 0x0000FFFF) >>> 0")
+                  pushLine(heapAccess("HU16", addr, offset + 2, 1) + " = ((" + value + ".low) & 0xFFFF0000) >>> 16")
+                  pushLine(heapAccess("HU16", addr, offset + 4, 1) + " = ((" + value + ".high) & 0x0000FFFF) >>> 0")
+                  pushLine(heapAccess("HU16", addr, offset + 6, 1) + " = ((" + value + ".high) & 0xFFFF0000) >>> 16")
+                  break
+                case 2:
+                  // Partially aligned, convert to i64 and write it out.
+                  i64_from_f64(value)
+                  value = popStackVar(TYPES.I64)
+                  pushLine(heapAccess("HU32", addr, offset + 0, 2) + " = " + value + ".low")
+                  pushLine(heapAccess("HU32", addr, offset + 4, 2) + " = " + value + ".high")
+                  break
+                case 3:
+                  // Natural alignment.
+                  pushLine(heapAccess("HF64", addr, offset, 3) + " = " + value)
+                  break
+                default:
+                  throw new CompileError("unsupported load flags: " + flags)
+              }
+              break
+
+            case OPCODES.I32_STORE8:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              pushLine(heapAccess("HU8", addr, offset, 0) + " = " + value + " & 0xFF")
+              break
+
+            case OPCODES.I32_STORE16:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, write two individual bytes
+                  pushLine(heapAccess("HU8", addr, offset + 0, 0) + " = (" + value + " & 0x00FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = (" + value + " & 0xFF00) >>> 8")
+                  break
+                case 1:
+                  // Natural alignment
+                  pushLine(heapAccess("HU16", addr, offset, 0) + " = (" + value + " & 0xFFFF)")
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.I64_STORE8:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 1)
+              pushLine(heapAccess("HU8", addr, offset, 0) + " = (" + value + ".low) & 0xFF")
+              break
+
+            case OPCODES.I64_STORE16:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I32)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 2)
+              switch (flags) {
+                case 0:
+                  // Unaligned, write two individual bytes
+                  pushLine(heapAccess("HU8", addr, offset + 0, 0) + " = ((" + value + ".low) & 0x00FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = ((" + value + ".low) & 0xFF00) >>> 8")
+                  break
+                case 1:
+                  // Natural alignment
+                  pushLine(heapAccess("HU16", addr, offset, 0) + " = ((" + value + ".low) & 0xFFFF)")
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.I64_STORE32:
+              var flags = read_varuint32()
+              var offset = read_varuint32()
+              var value = popStackVar(TYPES.I64)
+              var addr = popStackVar(TYPES.I32)
+              boundsCheck(addr, offset, 4)
+              switch (flags) {
+                case 0:
+                  // Unaligned, write four individual bytes
+                  pushLine(heapAccess("HU8", addr, offset + 0, 0) + " = ((" + value + ".low) & 0x000000FF) >>> 0")
+                  pushLine(heapAccess("HU8", addr, offset + 1, 0) + " = ((" + value + ".low) & 0x0000FF00) >>> 8")
+                  pushLine(heapAccess("HU8", addr, offset + 2, 0) + " = ((" + value + ".low) & 0x00FF0000) >>> 16")
+                  pushLine(heapAccess("HU8", addr, offset + 3, 0) + " = ((" + value + ".low) & 0xFF000000) >>> 24")
+                  break
+                case 1:
+                  // Partially aligned, write two 16-bit words
+                  pushLine(heapAccess("HU16", addr, offset + 0, 1) + " = ((" + value + ".low) & 0x0000FFFF) >>> 0")
+                  pushLine(heapAccess("HU16", addr, offset + 2, 1) + " = ((" + value + ".low) & 0xFFFF0000) >>> 16")
+                  break
+                case 2:
+                  // Natural alignment
+                  pushLine(heapAccess("HU32", addr, offset + 0, 2) + " = " + value + ".low")
+                  break
+                default:
+                  throw new CompileError("unsupported load flags")
+              }
+              break
+
+            case OPCODES.CURRENT_MEMORY:
+              read_varuint1()
+              pushLine(pushStackVar(TYPES.I32) + " = currentMemory|0")
+              break
+
+            case OPCODES.GROW_MEMORY:
+              read_varuint1()
+              popStackVar(TYPES.I32)
+              pushLine("trap() // grow_memory not implemented yet")
+              pushStackVar(TYPES.I32)
               break
 
             case OPCODES.I32_CONST:
@@ -2290,6 +2748,12 @@
               f64_binaryFunc("f64_copysign")
               break
 
+            case OPCODES.I32_WRAP_I64:
+              var operand = popStackVar(TYPES.I64)
+              var output = pushStackVar(TYPES.I32)
+              pushLine(output + " = " + operand + ".low")
+              break
+
             case OPCODES.I32_REINTERPRET_F32:
               var operand = popStackVar(TYPES.F32)
               var output = pushStackVar(TYPES.I32)
@@ -2309,13 +2773,13 @@
         pushLine("// compiled successfully")
 
         return c
-        //}
-        //finally {
-        //  dump("---") 
-        //  dump(f.name)
-        //  dump(c.body_lines.join("\n"))
-        //  dump("---") 
-        //}
+        }
+        finally {
+          dump("---") 
+          dump(f.name)
+          dump(c.body_lines.join("\n"))
+          dump("---") 
+        }
       }
     }
 
@@ -2370,11 +2834,11 @@
       }
     })
 
-    // XXX TODO: declare tables.
+    // Create requested tables.
 
     var tables = sections[SECTIONS.TABLE] || []
     tables.forEach(function(t, idx) {
-      notImplemented()
+      src.push("var T" + idx + " = new WebAssembly.Table(" + JSON.stringify(t.limits) + ")")
     })
 
     // Create requested memory, and provide views into it.
@@ -2410,11 +2874,14 @@
       Array.prototype.push.apply(src, f.code.footer_lines)
     })
 
-    // XXX TODO: handle elements declarations.
+    // Fill the table with defined elements, if any.
+    // XXX TODO: bounds checking etc
 
     var elements = sections[SECTIONS.ELEMENT] || []
     elements.forEach(function(e, idx) {
-      notImplemented()
+      for (var i = 0; i < e.elems.length; i++) {
+        src.push("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
+      }
     })
 
     // Fill the memory with data from the module.
@@ -2598,6 +3065,10 @@
       return scratchData.getFloat32(0, true)
     }
     return stdlib.f32_signof(y) * Math.abs(x)
+  }
+  stdlib.f32_reinterpret_i32 = function(v) {
+    scratchData.setInt32(0, v, true)
+    return scratchData.getFloat32(0, true)
   }
 
   // f64 operations
