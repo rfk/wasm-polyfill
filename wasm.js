@@ -198,7 +198,7 @@
       }
     })
     // Instantiate the compiled javascript module, which will give us all the exports.
-    this.exports = moduleObject._internals.jsmodule(imports)
+    this.exports = moduleObject._internals.jsmodule(imports, stdlib)
   }
 
 
@@ -2235,102 +2235,11 @@
     //dump("---- RENDERING CODE ----")
     var src = []
 
-    // Basic setup, helper functions, etc.
+    // Import all the things from the stdlib.
 
-    src.push("var Long = WebAssembly._Long")
-    src.push("var INT32_MIN = 0x80000000|0")
-    src.push("var INT32_MAX = 0x7FFFFFFF|0")
-    src.push("var trap = function() { throw new WebAssembly.RuntimeError() }")
-    src.push("var imul32 = Math.imul")
-    src.push("var clz32 = Math.clz32")
-    src.push("var rotl32 = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}")
-    src.push("var rotr32 = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}")
-    src.push("var ctz32 = function(v) {")
-    src.push("  v = v|0")
-    src.push("  var count = 0")
-    src.push("  var bit = 0x01")
-    src.push("  while (bit && (v & bit) === 0) {")
-    src.push("    count++")
-    src.push("    bit = (bit << 1) & 0xFFFFFFFF")
-    src.push("  }")
-    src.push("  return count")
-    src.push("}")
-    src.push("var popcnt32 = function(v) {")
-    src.push("  v = v|0")
-    src.push("  var count = 0")
-    src.push("  var bit = 0x01")
-    src.push("  while (bit) {")
-    src.push("    if (v & bit) { count++ }")
-    src.push("    bit = (bit << 1) & 0xFFFFFFFF")
-    src.push("  }")
-    src.push("  return count")
-    src.push("}")
-    src.push("var iadd64 = function(lhs, rhs) { return lhs.add(rhs) }")
-    src.push("var isub64 = function(lhs, rhs) { return lhs.sub(rhs) }")
-    src.push("var imul64 = function(lhs, rhs) { return lhs.mul(rhs) }")
-    src.push("var idiv64_s = function(lhs, rhs) { return lhs.div(rhs) }")
-    src.push("var idiv64_u = function(lhs, rhs) { return lhs.toUnsigned().div(rhs.toUnsigned().toUnsigned()) }")
-    src.push("var irem64_s = function(lhs, rhs) { return lhs.mod(rhs) }")
-    src.push("var irem64_u = function(lhs, rhs) { return lhs.toUnsigned().mod(rhs.toUnsigned()).toUnsigned().toSigned() }")
-    src.push("var iand64 = function(lhs, rhs) { return lhs.and(rhs) }")
-    src.push("var ior64 = function(lhs, rhs) { return lhs.or(rhs) }")
-    src.push("var ixor64 = function(lhs, rhs) { return lhs.xor(rhs) }")
-    src.push("var ishl64 = function(lhs, rhs) { return lhs.shl(rhs) }")
-    src.push("var ishr64_s = function(lhs, rhs) { return lhs.shr(rhs) }")
-    src.push("var ishr64_u = function(lhs, rhs) { return lhs.shru(rhs) }")
-    src.push("var ieq64 = function(lhs, rhs) { return lhs.eq(rhs) }")
-    src.push("var ine64 = function(lhs, rhs) { return lhs.neq(rhs) }")
-    src.push("var ilt64_s = function(lhs, rhs) { return lhs.lt(rhs) }")
-    src.push("var ilt64_u = function(lhs, rhs) { return lhs.toUnsigned().lt(rhs.toUnsigned()) }")
-    src.push("var igt64_s = function(lhs, rhs) { return lhs.gt(rhs) }")
-    src.push("var igt64_u = function(lhs, rhs) { return lhs.toUnsigned().gt(rhs.toUnsigned()) }")
-    src.push("var ile64_s = function(lhs, rhs) { return lhs.lte(rhs) }")
-    src.push("var ile64_u = function(lhs, rhs) { return lhs.toUnsigned().lte(rhs.toUnsigned()) }")
-    src.push("var ige64_s = function(lhs, rhs) { return lhs.gte(rhs) }")
-    src.push("var ige64_u = function(lhs, rhs) { return lhs.toUnsigned().gte(rhs.toUnsigned()) }")
-    src.push("var irotl64 = function(v, n) { return v.shl(n).or(v.shru(Long.fromNumber(64).sub(n)))}")
-    src.push("var irotr64 = function(v, n) { return v.shru(n).or(v.shl(Long.fromNumber(64).sub(n)))}")
-    src.push("var iclz64 = function(v) {")
-    src.push("  var count = clz32(v.getHighBits())")
-    src.push("  if (count === 32) {")
-    src.push("    count += clz32(v.getLowBits())")
-    src.push("  }")
-    src.push("  return Long.fromNumber(count)")
-    src.push("}")
-    src.push("var ictz64 = function(v) {")
-    src.push("  var count = ctz32(v.getLowBits())")
-    src.push("  if (count === 32) {")
-    src.push("    count += ctz32(v.getHighBits())")
-    src.push("  }")
-    src.push("  return Long.fromNumber(count)")
-    src.push("}")
-    src.push("var ipopcnt64 = function(v) {")
-    src.push("  return Long.fromNumber(popcnt32(v.getHighBits()) + popcnt32(v.getLowBits()))")
-    src.push("}")
-    src.push("var ToF32 = Math.fround")
-    src.push("var f32_min = Math.min")
-    src.push("var f32_max = Math.max")
-    src.push("var f32_abs = Math.abs")
-    src.push("var f32_sqrt = Math.sqrt")
-    src.push("var f32_floor = Math.floor")
-    src.push("var f32_ceil = Math.ceil")
-    src.push("var f32_trunc = Math.trunc")
-    src.push("var f32_nearest = function (v) {")
-    src.push("  // ties to even...")
-    src.push("  if (Math.abs(v - Math.trunc(v)) === 0.5) { return 2 * Math.round(v / 2) }")
-    src.push("  return Math.round(v)")
-    src.push("}")
-    src.push("var scratchBuf = new ArrayBuffer(8)")
-    src.push("var scratchBytes = new Uint8Array(scratchBuf)")
-    src.push("var scratchData = new DataView(scratchBuf)")
-    src.push("var f32_signof = function(v) {")
-    src.push("  if (isNaN) {")
-    src.push("    scratchData.setFloat32(0, v, true)")
-    src.push("    return (scratchBytes[3] & 0x80) ? -1 : 1")
-    src.push("  }")
-    src.push("  return (y > 0 || 1 / y > 0) ? 1 : -1")
-    src.push("}")
-    src.push("var f32_copysign = function(x, y) { return f32_signof(y) * Math.abs(x) }")
+    Object.keys(stdlib).forEach(function(key) {
+      src.push("  const " + key + " = stdlib." + key)
+    })
 
     // Pull in various imports.
 
@@ -2438,9 +2347,122 @@
     var code = src.join("\n")
     //dump(code)
     //dump("---")
-    return new Function('imports', code)
+    return new Function("imports", "stdlib", code)
   }
 
+
+  //
+  // A "standard library" of utility functions for the copiled code.
+  // Many of these are likely to be suboptimal, but it's a start.
+  //
+
+  var scratchBuf = new ArrayBuffer(8)
+  var scratchBytes = new Uint8Array(scratchBuf)
+  var scratchData = new DataView(scratchBuf)
+
+  var stdlib = {}
+
+  // Helpful constants.
+  stdlib.INT32_MIN = 0x80000000|0
+  stdlib.INT32_MAX = 0x7FFFFFFF|0
+
+  // Misc structural functions.
+  stdlib.trap = function() { throw new WebAssembly.RuntimeError() }
+
+  // i32 operations that are not primitive operators
+  stdlib.imul32 = Math.imul
+  stdlib.clz32 = Math.clz32
+  stdlib.rotl32 = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}
+  stdlib.rotr32 = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}
+  stdlib.ctz32 = function(v) {
+    v = v|0
+    var count = 0
+    var bit = 0x01
+    while (bit && (v & bit) === 0) {
+      count++
+      bit = (bit << 1) & 0xFFFFFFFF
+    }
+    return count
+  }
+  stdlib.popcnt32 = function(v) {
+    v = v|0
+    var count = 0
+    var bit = 0x01
+    while (bit) {
+      if (v & bit) { count++ }
+      bit = (bit << 1) & 0xFFFFFFFF
+    }
+    return count
+  }
+
+  // i64 operations
+  stdlib.iadd64 = function(lhs, rhs) { return lhs.add(rhs) }
+  stdlib.isub64 = function(lhs, rhs) { return lhs.sub(rhs) }
+  stdlib.imul64 = function(lhs, rhs) { return lhs.mul(rhs) }
+  stdlib.idiv64_s = function(lhs, rhs) { return lhs.div(rhs) }
+  stdlib.idiv64_u = function(lhs, rhs) { return lhs.toUnsigned().div(rhs.toUnsigned().toUnsigned()) }
+  stdlib.irem64_s = function(lhs, rhs) { return lhs.mod(rhs) }
+  stdlib.irem64_u = function(lhs, rhs) { return lhs.toUnsigned().mod(rhs.toUnsigned()).toUnsigned().toSigned() }
+  stdlib.iand64 = function(lhs, rhs) { return lhs.and(rhs) }
+  stdlib.ior64 = function(lhs, rhs) { return lhs.or(rhs) }
+  stdlib.ixor64 = function(lhs, rhs) { return lhs.xor(rhs) }
+  stdlib.ishl64 = function(lhs, rhs) { return lhs.shl(rhs) }
+  stdlib.ishr64_s = function(lhs, rhs) { return lhs.shr(rhs) }
+  stdlib.ishr64_u = function(lhs, rhs) { return lhs.shru(rhs) }
+  stdlib.ieq64 = function(lhs, rhs) { return lhs.eq(rhs) }
+  stdlib.ine64 = function(lhs, rhs) { return lhs.neq(rhs) }
+  stdlib.ilt64_s = function(lhs, rhs) { return lhs.lt(rhs) }
+  stdlib.ilt64_u = function(lhs, rhs) { return lhs.toUnsigned().lt(rhs.toUnsigned()) }
+  stdlib.igt64_s = function(lhs, rhs) { return lhs.gt(rhs) }
+  stdlib.igt64_u = function(lhs, rhs) { return lhs.toUnsigned().gt(rhs.toUnsigned()) }
+  stdlib.ile64_s = function(lhs, rhs) { return lhs.lte(rhs) }
+  stdlib.ile64_u = function(lhs, rhs) { return lhs.toUnsigned().lte(rhs.toUnsigned()) }
+  stdlib.ige64_s = function(lhs, rhs) { return lhs.gte(rhs) }
+  stdlib.ige64_u = function(lhs, rhs) { return lhs.toUnsigned().gte(rhs.toUnsigned()) }
+  stdlib.irotl64 = function(v, n) { return v.shl(n).or(v.shru(Long.fromNumber(64).sub(n)))}
+  stdlib.irotr64 = function(v, n) { return v.shru(n).or(v.shl(Long.fromNumber(64).sub(n)))}
+  stdlib.iclz64 = function(v) {
+    var count = clz32(v.getHighBits())
+    if (count === 32) {
+      count += clz32(v.getLowBits())
+    }
+    return Long.fromNumber(count)
+  }  
+  stdlib.ictz64 = function(v) {
+    var count = ctz32(v.getLowBits())
+    if (count === 32) {
+      count += ctz32(v.getHighBits())
+    }
+    return Long.fromNumber(count)
+  }
+  stdlib.ipopcnt64 = function(v) {
+    return Long.fromNumber(popcnt32(v.getHighBits()) + popcnt32(v.getLowBits()))
+  }
+
+  // f32 operations
+  stdlib.ToF32 = Math.fround
+  stdlib.f32_min = Math.min
+  stdlib.f32_max = Math.max
+  stdlib.f32_abs = Math.abs
+  stdlib.f32_sqrt = Math.sqrt
+  stdlib.f32_floor = Math.floor
+  stdlib.f32_ceil = Math.ceil
+  stdlib.f32_trunc = Math.trunc
+  stdlib.f32_nearest = function (v) {
+    // ties to even...there must be a better way??
+    if (Math.abs(v - Math.trunc(v)) === 0.5) { return 2 * Math.round(v / 2) }
+    return Math.round(v)
+  }
+  stdlib.f32_signof = function(v) {
+    if (isNaN) {
+      scratchData.setFloat32(0, v, true)
+      return (scratchBytes[3] & 0x80) ? -1 : 1
+    }
+    return (y > 0 || 1 / y > 0) ? 1 : -1
+  }
+  stdlib.f32_copysign = function (x, y) {
+    return stdlib.f32_signof(y) * Math.abs(x)
+  }
 
   //
   // Various misc helper functions.
@@ -2518,10 +2540,6 @@
     }
     return null
   }
-
-  var scratchBuf = new ArrayBuffer(8)
-  var scratchBytes = new Uint8Array(scratchBuf)
-  var scratchData = new DataView(scratchBuf)
 
   function renderJSValue(v) {
     // We need to preserve two things that don't round-trip through v.toString():
