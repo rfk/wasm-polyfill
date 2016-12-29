@@ -634,11 +634,19 @@
     // and doing some type-checking etc.  You can distinguish
     // primitive-value reads by being named read_XYZ()
 
+    function checkEndOfBytes() {
+      if (idx >= bytes.length) {
+        throw new CompileError("unepected end of bytes")
+      }
+    }
+
     function read_byte() {
+      checkEndOfBytes()
       return bytes[idx++]
     }
 
     function read_bytes(count) {
+      checkEndOfBytes()
       output = []
       while (count > 0) {
         output.push(String.fromCharCode(bytes[idx++]))
@@ -648,15 +656,18 @@
     }
 
     function read_uint8() {
+      checkEndOfBytes()
       return bytes[idx++]
     }
 
     function read_uint16() {
+      checkEndOfBytes()
       return (bytes[idx++]) |
              (bytes[idx++] << 8)
     }
 
     function read_uint32() {
+      checkEndOfBytes()
       return (bytes[idx++]) |
              (bytes[idx++] << 8) |
              (bytes[idx++] << 16) |
@@ -682,6 +693,7 @@
     }
 
     function read_varuint32() {
+      checkEndOfBytes()
       var b = 0
       var result = 0
       var shift = 0
@@ -705,6 +717,7 @@
     }
 
     function read_varint32() {
+      checkEndOfBytes()
       var b = 0
       var result = 0
       var shift = 0
@@ -723,6 +736,7 @@
     }
 
     function read_varint64() {
+      checkEndOfBytes()
       // This is a little fiddly, we have to split the loop into
       // two halves so we can read the low and high parts into
       // two separate 32-bit integers.
@@ -768,6 +782,7 @@
     }
 
     function read_f32() {
+      checkEndOfBytes()
       var dv = new DataView(bytes.buffer)
       var v = dv.getFloat32(idx, true)
       // XXX TODO: is it possible to preserve the signalling bit of a NaN?
@@ -786,6 +801,7 @@
     }
 
     function read_f64() {
+      checkEndOfBytes()
       var dv = new DataView(bytes.buffer)
       var v = dv.getFloat64(idx, true)
       idx += 8
@@ -915,10 +931,13 @@
     function parseKnownSections() {
       while (idx < bytes.length) {
         var id = read_varuint7()
-        // Ignoring named sections for now
         var payload_len = read_varuint32()
         var next_section_idx = idx + payload_len
+        // Ignoring named sections for now, but parsing
+        // them just enough to detect well-formedness.
         if (!id) {
+          var name_len = read_varuint32()
+          read_bytes(name_len)
           idx = next_section_idx
           continue
         }
@@ -1192,6 +1211,12 @@
     function parseCodeSection() {
       var numImportedFunctions = getImportedFunctions().length
       var count = read_varuint32()
+      if (sections[SECTIONS.FUNCTION] === null) {
+        throw new CompileError("code section without function section")
+      }
+      if (count !== sections[SECTIONS.FUNCTION].length) {
+        throw new CompileError("code section size different to function section size")
+      }
       var entries = []
       while (count > 0) {
         entries.push(parseFunctionBody(entries.length))
