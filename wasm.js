@@ -1,5 +1,8 @@
 (function(globalScope) {
 
+  // XXX TODO: more generic polyfill for this
+  var Long = require("long")
+
   //
   // The exports, trying to match the builtin JS API as much as possible.
   // 
@@ -13,7 +16,9 @@
     Table: Table,
     compile: compile,
     instantiate: instantiate,
-    validate: validate
+    validate: validate,
+    _Long: Long,
+    _dump: dump
   }
 
   if (typeof module !== "undefined") {
@@ -24,6 +29,19 @@
 
   if (globalScope && typeof globalScope.WebAssembly === "undefined")  {
     globalScope.WebAssembly = WebAssembly
+  }
+
+  function dump() {
+    for (var i = 0; i < arguments.length; i++) {
+      var arg = arguments[i]
+      if (typeof arg === 'string') {
+        process.stderr.write(arg)
+      } else {
+        process.stderr.write(JSON.stringify(arg))
+      }
+      process.stderr.write(' ')
+    }
+    process.stderr.write('\n')
   }
 
   //
@@ -480,7 +498,7 @@
       I64_POPCNT: 0x7b,
       I64_ADD: 0x7c,
       I64_SUB: 0x7d,
-      I64_NUL: 0x7e,
+      I64_MUL: 0x7e,
       I64_DIV_S: 0x7f,
       I64_DIV_U: 0x80,
       I64_REM_S: 0x81,
@@ -656,8 +674,48 @@
     }
 
     function read_varint64() {
-      // No 64-bit integers yet, because javascript.
-      notImplemented()
+      // This is a little fiddly, we have to split the loop into
+      // two halves so we can read the low and high parts into
+      // two separate 32-bit integers.
+      var b = 0
+      var low = 0
+      var high = 0
+      var shift = 0
+      // Read the low bits first.
+      // If the low bits are full, this will also ready the first few high bits.
+      do {
+        if (shift > 32) {
+          break
+        }
+        b = bytes[idx++]
+        low = ((b & 0x7F) << shift) | low
+        shift += 7
+      } while (b & 0x80)
+      // Did we read the full 32 low bits?
+      if (shift < 32) {
+        // Nope.  Need to sign-extend into both low and high.
+        if (b & 0x40) {
+          low = (-1 << shift) | low
+          high = -1
+        }
+      } else {
+        // Yep. The first 3 high bits will be in the already-read byte.
+        shift = 3
+        var high = (b & 0x7F) >> 4
+        while (b & 0x80) {
+          if (shift > 32) {
+            throw new CompileError("varuint64 too large")
+          }
+          b = bytes[idx++]
+          high = ((b & 0x7F) << shift) | high
+          shift += 7
+        }
+        // Sign-extend into the high bits.
+        if (b & 0x40 && shift < 32) {
+          high = (-1 << shift) | high
+        }
+      } 
+      return new Long(low, high)
     }
 
     function read_f32() {
@@ -1019,15 +1077,15 @@
     function getFunctionSignature(index) {
       var count = 0
       var imports = sections[SECTIONS.IMPORT] || []
-      imports.forEach(function(i) {
-        if (i.kind === EXTERNAL_KINDS.FUNCTION) {
+      for (var i = 0; i < imports.length; i++) {
+        if (imports[i].kind === EXTERNAL_KINDS.FUNCTION) {
           if (index === count) {
             // It refers to an imported function.
-            return getTypeSignature(i.type)
+            return getTypeSignature(imports[i].type)
           }
           count++
         }
-      })
+      }
       // It must refer to a locally-defined function.
       index -= count
       var functions = sections[SECTIONS.FUNCTION] || []
@@ -1092,12 +1150,6 @@
       function parseFunctionCode(f) {
         //try {
         var c = {
-          numvars_local_i32: 0,
-          numvars_local_f32: 0,
-          numvars_local_f64: 0,
-          numvars_stack_i32: 0,
-          numvars_stack_f32: 0,
-          numvars_stack_f64: 0,
           header_lines: ["function " + f.name + "(" + makeParamList() + ") {"],
           body_lines: [],
           footer_lines: ["}"]
@@ -1118,21 +1170,23 @@
           prevStackHeights: {}
         }]
         cfStack[0].prevStackHeights[TYPES.I32] = 0
+        cfStack[0].prevStackHeights[TYPES.I64] = 0
         cfStack[0].prevStackHeights[TYPES.F32] = 0
         cfStack[0].prevStackHeights[TYPES.F64] = 0
 
         function printStack() {
-          console.log("--")
+          dump("--")
           for (var i = cfStack.length - 1; i >= 0; i--) {
-            console.log(cfStack[i].polymorphic ? "*" : "-", cfStack[i].typeStack)
+            dump(cfStack[i].polymorphic ? "*" : "-", cfStack[i].typeStack)
           }
-          console.log("--")
+          dump("--")
         }
 
         function pushControlFlow(op, sig) {
           var prevCf = cfStack[cfStack.length - 1]
           var prevStackHeights = {}
           prevStackHeights[TYPES.I32] = prevCf.prevStackHeights[TYPES.I32]
+          prevStackHeights[TYPES.I64] = prevCf.prevStackHeights[TYPES.I64]
           prevStackHeights[TYPES.F32] = prevCf.prevStackHeights[TYPES.F32]
           prevStackHeights[TYPES.F64] = prevCf.prevStackHeights[TYPES.F64]
           prevCf.typeStack.forEach(function(typ) {
@@ -1214,6 +1268,8 @@
           switch (typ) {
             case TYPES.I32:
               return "si" + height
+            case TYPES.I64:
+              return "sl" + height
             case TYPES.F32:
               return "sf" + height
             case TYPES.F64:
@@ -1231,6 +1287,8 @@
           switch (cf.sig) {
             case TYPES.I32:
               return "si" + height
+            case TYPES.I64:
+              return "sl" + height
             case TYPES.F32:
               return "sf" + height
             case TYPES.F64:
@@ -1269,6 +1327,8 @@
           switch (typ) {
             case TYPES.I32:
               return "li" + index
+            case TYPES.I64:
+              return "ll" + index
             case TYPES.F32:
               return "lf" + index
             case TYPES.F64:
@@ -1296,6 +1356,23 @@
           var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
           var lhs = "(" + popStackVar(TYPES.I32) + cast + ")"
           pushLine(pushStackVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
+        }
+
+        function i64_unaryFunc(what) {
+          var operand = getStackVar(TYPES.I64)
+          pushLine(operand + " = " + what + "(" + operand + ")")
+        }
+
+        function i64_binaryFunc(what) {
+          var rhs = "(" + popStackVar(TYPES.I64) + ")"
+          var lhs = "(" + popStackVar(TYPES.I64) + ")"
+          pushLine(pushStackVar(TYPES.I64) + " = " + what + "(" + lhs + ", " + rhs + ")")
+        }
+
+        function i64_compareFunc(what) {
+          var rhs = "(" + popStackVar(TYPES.I64) + ")"
+          var lhs = "(" + popStackVar(TYPES.I64) + ")"
+          pushLine(pushStackVar(TYPES.I32) + " = " + what + "(" + lhs + ", " + rhs + ")|0")
         }
 
         function f32_compareOp(what) {
@@ -1532,8 +1609,11 @@
               break
 
             case OPCODES.RETURN:
-              // XXX TODO: check that we're returning something of correct type
-              pushLine("return " + popStackVar())
+              if (f.sig.return_types.length === 0) {
+                pushLine("return")
+              } else {
+                pushLine("return " + popStackVar(f.sig.return_types[0]))
+              }
               goPolymorphic()
               deadCodeZone = true
               break
@@ -1541,15 +1621,19 @@
             case OPCODES.CALL:
               var index = read_varuint32()
               var callSig = getFunctionSignature(index)
-              // XXX TODO: in what order do we pop args, FIFO or LIFO?
-              var args = []
-              callSig.param_types.forEach(function(typ) {
-                args.push(popStackVar(typ))
-              })
-              pushLine("F" + index + "(" + args.join(",") + ")")
-              callSig.return_types.forEach(function(typ) {
-                pushStackVar(type)
-              })
+              // The rightmost arg is the one on top of stack,
+              // so we have to pop them in reverse.
+              var args = new Array(callSig.param_types.length)
+              for (var i = callSig.param_types.length - 1; i >= 0; i--) {
+                args[i] = popStackVar(callSig.param_types[i])
+              }
+              if (callSig.return_types.length === 0) {
+                pushLine("F" + index + "(" + args.join(",") + ")")
+              } else {
+                // We know there's at most one return type, for now.
+                var output = pushStackVar(callSig.return_types[0])
+                pushLine(output + " = F" + index + "(" + args.join(",") + ")")
+              }
               break
 
             case OPCODES.CALL_INDIRECT:
@@ -1729,7 +1813,8 @@
               break
 
             case OPCODES.I64_CONST:
-              throw new CompileError("i64 support not implemented yet")
+              var v = read_varint64()
+              pushLine(pushStackVar(TYPES.I64) + " = new Long(" + v.low + "," + v.high + ")")
               break
 
             case OPCODES.F32_CONST:
@@ -1785,6 +1870,52 @@
               i32_binaryOp(">=", ">>>0")
               break
 
+            case OPCODES.I64_EQZ:
+              var operand = popStackVar(TYPES.I64)
+              var result = pushStackVar(TYPES.I32)
+              pushLine(result + " = (" + operand + ".isZero())|0")
+              break
+
+            case OPCODES.I64_EQ:
+              i64_compareFunc("ieq64")
+              break
+
+            case OPCODES.I64_NE:
+              i64_compareFunc("ine64")
+              break
+
+            case OPCODES.I64_LT_S:
+              i64_compareFunc("ilt64_s")
+              break
+
+            case OPCODES.I64_LT_U:
+              i64_compareFunc("ilt64_u")
+              break
+
+            case OPCODES.I64_GT_S:
+              i64_compareFunc("igt64_s")
+              break
+
+            case OPCODES.I64_GT_U:
+              i64_compareFunc("igt64_u")
+              break
+
+            case OPCODES.I64_LE_S:
+              i64_compareFunc("ile64_s")
+              break
+
+            case OPCODES.I64_LE_U:
+              i64_compareFunc("ile64_u")
+              break
+
+            case OPCODES.I64_GE_S:
+              i64_compareFunc("ige64_s")
+              break
+
+            case OPCODES.I64_GE_U:
+              i64_compareFunc("ige64_u")
+              break
+
             case OPCODES.F32_EQ:
               f32_compareOp("===")
               break
@@ -1810,17 +1941,15 @@
               break
 
             case OPCODES.I32_CLZ:
-              i32_unaryOp("clz")
+              i32_unaryOp("clz32")
               break
 
             case OPCODES.I32_CTZ:
-              var op = getStackVar(TYPES.I32)
-              pushLine(op + " = ctz(" + op + ")")
+              i32_unaryOp("ctz32")
               break
 
             case OPCODES.I32_POPCNT:
-              var op = getStackVar(TYPES.I32)
-              pushLine(op + " = popcnt(" + op + ")")
+              i32_unaryOp("popcnt32")
               break
 
             case OPCODES.I32_ADD:
@@ -1832,7 +1961,7 @@
               break
 
             case OPCODES.I32_MUL:
-              i32_binaryFunc("imul")
+              i32_binaryFunc("imul32")
               break
 
             case OPCODES.I32_DIV_S:
@@ -1896,19 +2025,101 @@
               i32_binaryFunc("rotr")
               break
 
+            case OPCODES.I64_CLZ:
+              i64_unaryFunc("iclz64")
+              break
+
+            case OPCODES.I64_CTZ:
+              i64_unaryFunc("ictz64")
+              break
+
+            case OPCODES.I64_POPCNT:
+              i64_unaryFunc("ipopcnt64")
+              break
+
+            case OPCODES.I64_ADD:
+              i64_binaryFunc("iadd64")
+              break
+
+            case OPCODES.I64_SUB:
+              i64_binaryFunc("isub64")
+              break
+
+            case OPCODES.I64_MUL:
+              i64_binaryFunc("imul64")
+              break
+
+            case OPCODES.I64_DIV_S:
+              var rhs = getStackVar(TYPES.I64)
+              var lhs = getStackVar(TYPES.I64, 1)
+              pushLine("if (" + rhs + ".isZero()) { return trap() }")
+              pushLine("if (" + lhs + ".eq(Long.MIN_VALUE) && " + rhs + ".eq(Long.NEG_ONE)) { return trap() }")
+              i64_binaryFunc("idiv64_s")
+              break
+
+            case OPCODES.I64_DIV_U:
+              var rhs = getStackVar(TYPES.I64)
+              pushLine("if (" + rhs + ".isZero()) { return trap() }")
+              i64_binaryFunc("idiv64_u")
+              break
+
+            case OPCODES.I64_REM_S:
+              var rhs = getStackVar(TYPES.I64)
+              pushLine("if (" + rhs + ".isZero()) { return trap() }")
+              i64_binaryFunc("irem64_s")
+              break
+
+            case OPCODES.I64_REM_U:
+              var rhs = getStackVar(TYPES.I64)
+              pushLine("if (" + rhs + ".isZero()) { return trap() }")
+              i64_binaryFunc("irem64_u")
+              break
+
+            case OPCODES.I64_AND:
+              i64_binaryFunc("iand64")
+              break
+
+            case OPCODES.I64_OR:
+              i64_binaryFunc("ior64")
+              break
+
+            case OPCODES.I64_XOR:
+              i64_binaryFunc("ixor64")
+              break
+
+            case OPCODES.I64_SHL:
+              i64_binaryFunc("ishl64")
+              break
+
+            case OPCODES.I64_SHR_S:
+              i64_binaryFunc("ishr64_s")
+              break
+
+            case OPCODES.I64_SHR_U:
+              i64_binaryFunc("ishr64_u")
+              break
+
+            case OPCODES.I64_ROTL:
+              i64_binaryFunc("irotl64")
+              break
+
+            case OPCODES.I64_ROTR:
+              i64_binaryFunc("irotr64")
+              break
+
             default:
               throw new CompileError("unsupported opcode: 0x" + op.toString(16))
           }
         }
-        //pushLine("// compiled successfully")
+        pushLine("// compiled successfully")
 
         return c
         //}
         //finally {
-        //  console.log("---") 
-        //  console.log(f.name)
-        //  console.log(c.body_lines.join("\n"))
-        //  console.log("---") 
+        //  dump("---") 
+        //  dump(f.name)
+        //  dump(c.body_lines.join("\n"))
+        //  dump("---") 
         //}
       }
     }
@@ -1939,19 +2150,20 @@
   }
 
   function renderSectionsToJS(sections) {
-    //console.log("---- RENDERING CODE ----")
+    //dump("---- RENDERING CODE ----")
     var src = []
 
     // Basic setup, helper functions, etc.
 
+    src.push("var Long = WebAssembly._Long")
     src.push("var INT32_MIN = 0x80000000|0")
     src.push("var INT32_MAX = 0x7FFFFFFF|0")
     src.push("var trap = function() { throw new WebAssembly.RuntimeError() }")
-    src.push("var imul = Math.imul")
-    src.push("var clz = Math.clz32")
-    src.push("var rotl = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}")
-    src.push("var rotr = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}")
-    src.push("var ctz = function(v) {")
+    src.push("var imul32 = Math.imul")
+    src.push("var clz32 = Math.clz32")
+    src.push("var rotl32 = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}")
+    src.push("var rotr32 = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}")
+    src.push("var ctz32 = function(v) {")
     src.push("  v = v|0")
     src.push("  var count = 0")
     src.push("  var bit = 0x01")
@@ -1961,7 +2173,7 @@
     src.push("  }")
     src.push("  return count")
     src.push("}")
-    src.push("var popcnt = function(v) {")
+    src.push("var popcnt32 = function(v) {")
     src.push("  v = v|0")
     src.push("  var count = 0")
     src.push("  var bit = 0x01")
@@ -1971,8 +2183,50 @@
     src.push("  }")
     src.push("  return count")
     src.push("}")
+    src.push("var iadd64 = function(lhs, rhs) { return lhs.add(rhs) }")
+    src.push("var isub64 = function(lhs, rhs) { return lhs.sub(rhs) }")
+    src.push("var imul64 = function(lhs, rhs) { return lhs.mul(rhs) }")
+    src.push("var idiv64_s = function(lhs, rhs) { return lhs.div(rhs) }")
+    src.push("var idiv64_u = function(lhs, rhs) { return lhs.toUnsigned().div(rhs.toUnsigned().toUnsigned()) }")
+    src.push("var irem64_s = function(lhs, rhs) { return lhs.mod(rhs) }")
+    src.push("var irem64_u = function(lhs, rhs) { return lhs.toUnsigned().mod(rhs.toUnsigned()).toUnsigned().toSigned() }")
+    src.push("var iand64 = function(lhs, rhs) { return lhs.and(rhs) }")
+    src.push("var ior64 = function(lhs, rhs) { return lhs.or(rhs) }")
+    src.push("var ixor64 = function(lhs, rhs) { return lhs.xor(rhs) }")
+    src.push("var ishl64 = function(lhs, rhs) { return lhs.shl(rhs) }")
+    src.push("var ishr64_s = function(lhs, rhs) { return lhs.shr(rhs) }")
+    src.push("var ishr64_u = function(lhs, rhs) { return lhs.shru(rhs) }")
+    src.push("var ieq64 = function(lhs, rhs) { return lhs.eq(rhs) }")
+    src.push("var ine64 = function(lhs, rhs) { return lhs.neq(rhs) }")
+    src.push("var ilt64_s = function(lhs, rhs) { return lhs.lt(rhs) }")
+    src.push("var ilt64_u = function(lhs, rhs) { return lhs.toUnsigned().lt(rhs.toUnsigned()) }")
+    src.push("var igt64_s = function(lhs, rhs) { return lhs.gt(rhs) }")
+    src.push("var igt64_u = function(lhs, rhs) { return lhs.toUnsigned().gt(rhs.toUnsigned()) }")
+    src.push("var ile64_s = function(lhs, rhs) { return lhs.lte(rhs) }")
+    src.push("var ile64_u = function(lhs, rhs) { return lhs.toUnsigned().lte(rhs.toUnsigned()) }")
+    src.push("var ige64_s = function(lhs, rhs) { return lhs.gte(rhs) }")
+    src.push("var ige64_u = function(lhs, rhs) { return lhs.toUnsigned().gte(rhs.toUnsigned()) }")
+    src.push("var irotl64 = function(v, n) { return v.shl(n).or(v.shru(Long.fromNumber(64).sub(n)))}")
+    src.push("var irotr64 = function(v, n) { return v.shru(n).or(v.shl(Long.fromNumber(64).sub(n)))}")
+    src.push("var iclz64 = function(v) {")
+    src.push("  var count = clz32(v.getHighBits())")
+    src.push("  if (count === 32) {")
+    src.push("    count += clz32(v.getLowBits())")
+    src.push("  }")
+    src.push("  return Long.fromNumber(count)")
+    src.push("}")
+    src.push("var ictz64 = function(v) {")
+    src.push("  var count = ctz32(v.getLowBits())")
+    src.push("  if (count === 32) {")
+    src.push("    count += ctz32(v.getHighBits())")
+    src.push("  }")
+    src.push("  return Long.fromNumber(count)")
+    src.push("}")
+    src.push("var ipopcnt64 = function(v) {")
+    src.push("  return Long.fromNumber(popcnt32(v.getHighBits()) + popcnt32(v.getLowBits()))")
+    src.push("}")
 
-    // XXX TODO: handle the imports
+    // Pull in various imports.
 
     var imports = sections[SECTIONS.IMPORT] || []
     var countFuncs = 0
@@ -2076,8 +2330,8 @@
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
-    //console.log(code)
-    //console.log("---")
+    //dump(code)
+    //dump("---")
     return new Function('imports', code)
   }
 
