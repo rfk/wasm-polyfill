@@ -1153,22 +1153,28 @@
       function parseFunctionCode(f) {
         try {
         var c = {
-          header_lines: ["function " + f.name + "(" + makeParamList() + ") {"],
+          header_lines: [],
           body_lines: [],
-          footer_lines: ["}"]
+          footer_lines: []
         }
+
+        var declaredVars = {}
+
+        c.header_lines.push("function " + f.name + "(" + makeParamList() + ") {")
+        c.footer_lines.push("}")
 
         function makeParamList() {
           var params = []
           f.sig.param_types.forEach(function(typ, idx) {
-            params.push(getLocalVar(idx, typ))
+            params.push(getLocalVar(idx, typ, true))
           })
           return params.join(",")
         }
 
         var cfStack = [{
           op: 0,
-          sig: 0, // XXX TODO: use function return sig?
+          sig: (f.sig.return_types.length > 0 ? f.sig.return_types[0] : TYPES.NONE),
+          index: 0,
           isDead: false,
           isPolymorphic: false,
           endReached: false,
@@ -1256,12 +1262,12 @@
         }
 
         function popStackVar(wantType) {
-          var name = getStackVar()
+          var name = getStackVar(wantType)
           var cf = cfStack[cfStack.length - 1]
           var typ = cf.typeStack.pop()
-          if (wantType && typ !== wantType && typ !== TYPES.UNKNOWN) {
+          if (wantType !== TYPES.UNKNOWN && typ !== wantType && typ !== TYPES.UNKNOWN) {
             if (! cf.isPolymorphic) {
-              throw new CompileError("Stack type mismatch: expected, " + wantType + ", found " + typ)
+              throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + typ)
             }
             return "UNDEFINED"
           }
@@ -1278,27 +1284,37 @@
             }
             return "UNREACHABLE"
           }
-          var typ = cf.typeStack[where]
+          if (typ !== cf.typeStack[where] && typ !== TYPES.UNKNOWN) {
+            throw new CompileError("Stack type mismatch: expected " + typ + ", found " + cf.typeStack[where])
+          }
           var height = cf.prevStackHeights[typ]
           for (var i = 0; i < where; i++) {
             if (cf.typeStack[i] === typ) {
               height += 1
             }
           }
+          var nm
           switch (typ) {
             case TYPES.I32:
-              return "si" + height
+              nm = "si" + height
+              break
             case TYPES.I64:
-              return "sl" + height
+              nm = "sl" + height
+              break
             case TYPES.F32:
-              return "sf" + height
+              nm = "sf" + height
+              break
             case TYPES.F64:
-              return "sd" + height
+              rm = "sd" + height
+              break
             case TYPES.UNKNOWN:
-              return "UNREACHABLE"
+              nm = "UNREACHABLE"
+              break
             default:
               throw new CompileError("unexpected type on stack: " + typ)
           }
+          declareVarName(typ, nm)
+          return nm
         }
 
         function getBlockOutputVar(cf) {
@@ -1322,7 +1338,7 @@
 
         function getBranchTarget(depth) {
           var which = cfStack.length - (1 + depth)
-          if (which <= 0) {
+          if (which < 0) {
             throw new CompileError("Branch depth too large")
           }
           return cfStack[which]
@@ -1344,19 +1360,55 @@
           throw new CompileError("local index too large: " + index)
         }
 
-        function getLocalVar(index, typ) {
+        function getLocalVar(index, typ, param) {
           typ = typ || getLocalType(index)
           switch (typ) {
             case TYPES.I32:
-              return "li" + index
+              nm =  "li" + index
+              break
             case TYPES.I64:
-              return "ll" + index
+              nm = "ll" + index
+              break
             case TYPES.F32:
-              return "lf" + index
+              nm = "lf" + index
+              break
             case TYPES.F64:
-              return "ld" + index
+              nm = "ld" + index
+              break
             default:
               throw new CompileError("unexpected type of local")
+          }
+          if (! param) {
+            declareVarName(typ, nm)
+          } else {
+            declaredVars[nm] = true
+          }
+          return nm
+        }
+
+        function declareVarName(typ, nm) {
+          var initVal = "trap()"
+          switch (typ) {
+            case TYPES.I32:
+              initVal = "0|0"
+              break
+            case TYPES.I64:
+              initVal = "Long.ZERO"
+              break
+            case TYPES.F32:
+              initVal = "0.0"
+              break
+            case TYPES.F64:
+              initVal = "0.0"
+              break
+            case TYPES.UNKNOWN:
+              return
+            default:
+              throw new CompileError("unexpected type of variable")
+          }
+          if (! declaredVars[nm]) {
+            c.header_lines.push("    var " + nm + " = " + initVal)
+            declaredVars[nm] = true
           }
         }
 
@@ -1549,7 +1601,6 @@
               } else {
                 // End of a control block
                 var cf = cfStack[cfStack.length - 1]
-                pushLine("// ENDING " + JSON.stringify(cf))
                 if (! cf.isDead) {
                   cf.endReached = true
                 } else if (cf.endReached && cf.sig !== TYPES.NONE) {
@@ -1576,6 +1627,7 @@
                     pushLine("} while(0)")
                     break
                   case OPCODES.LOOP:
+                    pushLine("  break")
                     pushLine("}")
                     break
                   case OPCODES.IF:
@@ -1593,7 +1645,6 @@
             case OPCODES.BR:
               var depth = read_varuint32()
               var cf = getBranchTarget(depth)
-              pushLine("// BR TO " + JSON.stringify(cf))
               switch (cf.op) {
                 case OPCODES.BLOCK:
                 case OPCODES.IF:
@@ -1606,6 +1657,15 @@
                     }
                   }
                   pushLine("break " + cf.label)
+                  break
+                case 0:
+                  cf.endReached = true
+                  if (cf.sig !== TYPES.NONE) {
+                    var resultVar = popStackVar(cf.sig)
+                    pushLine("return " + resultVar)
+                  } else {
+                    pushLine("return")
+                  }
                   break
                 case OPCODES.LOOP:
                   pushLine("continue " + cf.label)
@@ -1626,6 +1686,9 @@
                   pushLine("if (" + popStackVar(TYPES.I32) + ") {")
                   if (cf.sig !== TYPES.NONE) {
                     // This is left on the stack if condition is not true.
+                    // XXX TODO this needs to check what's on the stack.
+                    pushLine("// STACK " + JSON.stringify(cfStack))
+                    pushLine("// BLOCK TYPE " + cf.sig)
                     var resultVar = getStackVar(cf.sig)
                     var outputVar = getBlockOutputVar(cf)
                     if (outputVar !== resultVar) {
@@ -1635,8 +1698,19 @@
                   pushLine("  break " + cf.label)
                   pushLine("}")
                   break
+                case 0:
+                  cf.endReached = true
+                  pushLine("if (" + popStackVar(TYPES.I32) + ") {")
+                  if (cf.sig !== TYPES.NONE) {
+                    var resultVar = getStackVar(cf.sig)
+                    pushLine("return " + resultVar)
+                  } else {
+                    pushLine("return")
+                  }
+                  pushLine("}")
+                  break
                 case OPCODES.LOOP:
-                  pushLine("if (" + popStackVar(TYPES.I32) + ") continue " + cf.label)
+                  pushLine("if (" + popStackVar(TYPES.I32) + ") { continue " + cf.label + " }")
                   break
                 default:
                   throw new CompileError("Branch to unsupported opcode")
@@ -1679,6 +1753,11 @@
                   case OPCODES.LOOP:
                     pushLine("    continue " + cf.label)
                     break
+                  case 0:
+                    pushLine("    return " + outputVar)
+                    break
+                  default:
+                    throw new CompileError("unknown branch target type")
                 }
               })
               pushLine("  default:")
@@ -1697,6 +1776,11 @@
                 case OPCODES.LOOP:
                   pushLine("    continue " + default_cf.label)
                   break
+                case 0:
+                  pushLine("    return " + outputVar)
+                  break
+                default:
+                  throw new CompileError("unknown branch target type")
               }
               pushLine("}")
               markDeadCode()
@@ -1760,14 +1844,15 @@
               var falseVar = popStackVar(typ)
               var trueVar = popStackVar(typ)
               pushStackVar(typ)
-              var outputVar = getStackVar()
+              var outputVar = getStackVar(typ)
               pushLine(outputVar + " = " + condVar + " ? " + trueVar + ":" + falseVar)
               break
 
             case OPCODES.GET_LOCAL:
               var index = read_varuint32()
-              pushStackVar(getLocalType(index))
-              pushLine(getStackVar() + " = " + getLocalVar(index))
+              var typ = getLocalType(index)
+              pushStackVar(typ)
+              pushLine(getStackVar(typ) + " = " + getLocalVar(index))
               break
 
             case OPCODES.SET_LOCAL:
@@ -1786,7 +1871,7 @@
               var index = read_varuint32()
               var typ = getGlobalType(index)
               pushStackVar(typ)
-              pushLine(getStackVar() + " = " + getGlobalVar(index, typ))
+              pushLine(getStackVar(typ) + " = " + getGlobalVar(index, typ))
               break
 
             case OPCODES.SET_GLOBAL:
@@ -2779,10 +2864,12 @@
         return c
         }
         finally {
-          dump("---") 
-          dump(f.name)
-          dump(c.body_lines.join("\n"))
-          dump("---") 
+          //dump("---") 
+          //dump(f.name + ":")
+          //dump(c.header_lines.join("\n"))
+          //dump(c.body_lines.join("\n"))
+          //dump(c.footer_lines.join("\n"))
+          //dump("---")
         }
       }
     }
