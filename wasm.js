@@ -175,10 +175,11 @@
       switch(i.kind) {
         case EXTERNAL_KINDS.FUNCTION:
           assertIsCallable(v)
-          // XXX TODO: check signature on Exported Function Exotic Object?
-          // XXX TODO: create host function that does necessary type mapping
-          // of args and return value.
-          imports.push(v)
+          if (v._wasmRawFunc) {
+            imports.push(v._wasmRawFunc)
+          } else {
+            imports.push(v)
+          }
           break
         case EXTERNAL_KINDS.GLOBAL:
           // XXX TODO: check if i is an immutable global, TypeError if not
@@ -200,23 +201,49 @@
     // Instantiate the compiled javascript module, which will give us all the exports.
     this._exports = moduleObject._internals.jsmodule(imports, stdlib)
 
-    // For test compatibilty, we want stack space exhaustion to trap.
-    // XXX TODO: this can't really be necessary in practice, right?
     this.exports = {}
     var self = this
     Object.keys(this._exports).forEach(function(key) {
-      self.exports[key] = function () {
-        try {
-          return self._exports[key].apply(this, arguments)
-        } catch (err) {
-          if (err instanceof RangeError) {
-            if (err.message.indexOf("call stack") >= 0) {
-              throw new RuntimeError("call stack exhausted")
+      var wasmFunc = self._exports[key]
+      if (!wasmFunc._wasmJSWrapper) {
+        wasmFunc._wasmJSWrapper = function () {
+          // Type-check and coerce arguments.
+          var args = []
+          ARGLOOP: for (var i = 0; i < wasmFunc._wasmTypeSigStr.length; i++) {
+            switch (wasmFunc._wasmTypeSigStr.charAt(i)) {
+              case 'i':
+                args.push(arguments[i]|0)
+                break
+              case 'l':
+                throw new RuntimeError("cannot pass i64 from js: " + arguments[i])
+              case 'f':
+                args.push(Math.fround(+arguments[i]))
+                break
+              case 'd':
+                args.push(+arguments[i])
+                break
+              case '-':
+                break ARGLOOP
+              default:
+                throw new RuntimeError("malformed _wasmTypeSigStr")
             }
           }
-          throw err
+          try {
+            return self._exports[key].apply(this, args)
+          } catch (err) {
+            // For test compatibilty, we want stack space exhaustion to trap.
+            // XXX TODO: this can't really be necessary in practice, right?
+            if (err instanceof RangeError) {
+              if (err.message.indexOf("call stack") >= 0) {
+                throw new RuntimeError("call stack exhausted")
+              }
+            }
+            throw err
+          }
         }
+        wasmFunc._wasmJSWrapper._wasmRawFunc = wasmFunc
       }
+      self.exports[key] = wasmFunc._wasmJSWrapper
     })
   }
 
@@ -1125,6 +1152,32 @@
       return typeSection[index]
     }
 
+    function makeSigStr(funcSig) {
+      var typeCodes = []
+      function typeCode(typ) {
+        switch (typ) {
+          case TYPES.I32:
+            return "i"
+          case TYPES.I64:
+            return "l"
+          case TYPES.F32:
+            return "f"
+          case TYPES.F64:
+            return "d"
+          default:
+            throw new CompileError("unexpected type: " + typ)
+        }
+      }
+      funcSig.param_types.forEach(function(typ) {
+        typeCodes.push(typeCode(typ))
+      })
+      typeCodes.push("->")
+      funcSig.return_types.forEach(function(typ) {
+        typeCodes.push(typeCode(typ))
+      })
+      return typeCodes.join("")
+    }
+
     function parseCodeSection() {
       var numImportedFunctions = getImportedFunctions().length
       var count = read_varuint32()
@@ -1140,6 +1193,7 @@
         // XXX TODO: check that the function entry exists
         f.name = "F" + (index + numImportedFunctions)
         f.sig = sections[SECTIONS.TYPE][sections[SECTIONS.FUNCTION][index]]
+        f.sigStr = makeSigStr(f.sig)
         var body_size = read_varuint32()
         var end_of_body_idx = idx + body_size
         var local_count = read_varuint32()
@@ -1834,23 +1888,41 @@
 
             case OPCODES.CALL_INDIRECT:
               var type_index = read_varuint32()
-              if (read_varuint1() !== 0) {
+              var table_index = read_varuint1()
+              if (table_index !== 0) {
                 throw new CompileError("MVP reserved-value constraint violation")
               }
+              if (!sections[SECTIONS.TABLE] || table_index >= sections[SECTIONS.TABLE].length) {
+                throw new CompileError("invalid table index")
+              }
               var callSig = getTypeSignature(type_index)
-              // XXX TODO: in what order do we pop args, FIFO or LIFO?
-              var args = []
-              callSig.param_types.forEach(function(typ) {
-                args.push(popStackVar(typ))
-              })
+              var callIdx = popStackVar(TYPES.I32)
+              // The rightmost arg is the one on top of stack,
+              // so we have to pop them in reverse.
+              var args = new Array(callSig.param_types.length)
+              for (var i = callSig.param_types.length - 1; i >= 0; i--) {
+                args[i] = popStackVar(callSig.param_types[i])
+              }
               // XXX TODO: how to dynamically check call signature?
               // Shall we just always call a stub that does this for us?
               // Shall we use asmjs-style signature-specific tables with
               // placeholders that trap?
-              pushLine("TABLE[" + popStackVar(TYPES.I32) + "](" + args.join(",") + ")")
-              callSig.return_types.forEach(function(typ) {
-                pushStackVar(typ)
-              })
+              // For now we just do a bunch of explicit checks.
+              pushLine("if (!T0[" + callIdx + "]) {")
+              pushLine("  trap()")
+              pushLine("}")
+              pushLine("if (T0[" + callIdx + "]._wasmTypeSigStr) {")
+              pushLine("  if (T0[" + callIdx + "]._wasmTypeSigStr !== '" + makeSigStr(callSig) + "') {")
+              pushLine("    trap()")
+              pushLine("  }")
+              pushLine("}")
+              if (callSig.return_types.length === 0) {
+                pushLine("T0[" + callIdx + "](" + args.join(",") + ")")
+              } else {
+                // We know there's at most one return type, for now.
+                var output = pushStackVar(callSig.return_types[0])
+                pushLine(output + " = T0[" + callIdx + "](" + args.join(",") + ")")
+              }
               break
 
             case OPCODES.DROP:
@@ -2982,6 +3054,8 @@
       Array.prototype.push.apply(src, f.code.header_lines)
       Array.prototype.push.apply(src, f.code.body_lines)
       Array.prototype.push.apply(src, f.code.footer_lines)
+      src.push(f.name + "._wasmTypeSigStr = '" + f.sigStr + "'")
+      src.push(f.name + "._wasmJSWrapper = null")
     })
 
     // Fill the table with defined elements, if any.
