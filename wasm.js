@@ -198,7 +198,26 @@
       }
     })
     // Instantiate the compiled javascript module, which will give us all the exports.
-    this.exports = moduleObject._internals.jsmodule(imports, stdlib)
+    this._exports = moduleObject._internals.jsmodule(imports, stdlib)
+
+    // For test compatibilty, we want stack space exhaustion to trap.
+    // XXX TODO: this can't really be necessary in practice, right?
+    this.exports = {}
+    var self = this
+    Object.keys(this._exports).forEach(function(key) {
+      self.exports[key] = function () {
+        try {
+          return self._exports[key].apply(this, arguments)
+        } catch (err) {
+          if (err instanceof RangeError) {
+            if (err.message.indexOf("call stack") >= 0) {
+              throw new RuntimeError("call stack exhausted")
+            }
+          }
+          throw err
+        }
+      }
+    })
   }
 
 
@@ -1305,7 +1324,7 @@
               nm = "sf" + height
               break
             case TYPES.F64:
-              rm = "sd" + height
+              nm = "sd" + height
               break
             case TYPES.UNKNOWN:
               nm = "UNREACHABLE"
