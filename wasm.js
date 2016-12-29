@@ -18,6 +18,7 @@
     instantiate: instantiate,
     validate: validate,
     _Long: Long,
+    _fromNaNBytes: _fromNaNBytes,
     _dump: dump
   }
 
@@ -36,6 +37,8 @@
       var arg = arguments[i]
       if (typeof arg === 'string') {
         process.stderr.write(arg)
+      } else if (typeof arg === 'number') {
+        process.stderr.write(renderJSValue(arg))
       } else {
         process.stderr.write(JSON.stringify(arg))
       }
@@ -519,7 +522,7 @@
       F32_NEAREST: 0x90,
       F32_SQRT: 0x91,
       F32_ADD: 0x92,
-      F32_SUB: 0x92,
+      F32_SUB: 0x93,
       F32_MUL: 0x94,
       F32_DIV: 0x95,
       F32_MIN: 0x96,
@@ -573,8 +576,8 @@
 
     var idx = 0;
 
-    // Here's what we actually do, but using a bunch
-    // of helper functions defined below.
+    // The top-level: return an array of the known sections.
+    // This uses a bunch of helper functions defined below.
 
     var sections = [null]
     parseFileHeader()
@@ -827,7 +830,7 @@
       e.op = read_byte()
       switch (e.op) {
         case OPCODES.I32_CONST:
-          e.jsexpr = "" + read_varint32()
+          e.jsexpr = renderJSValue(read_varint32())
           break
         case OPCODES.GET_GLOBAL:
           e.value = read_varint32()
@@ -1381,6 +1384,23 @@
           pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")|0")
         }
 
+        function f32_unaryOp(what) {
+          var operand = popStackVar(TYPES.F32)
+          pushLine(pushStackVar(TYPES.F32) + " = ToF32(" + what +"(" + operand + "))")
+        }
+
+        function f32_binaryOp(what) {
+          var rhs = popStackVar(TYPES.F32)
+          var lhs = popStackVar(TYPES.F32)
+          pushLine(pushStackVar(TYPES.F32) + " = ToF32(" + lhs + " " + what + " " + rhs + ")")
+        }
+
+        function f32_binaryFunc(what) {
+          var rhs = popStackVar(TYPES.F32)
+          var lhs = popStackVar(TYPES.F32)
+          pushLine(pushStackVar(TYPES.F32) + " = ToF32(" + what + "(" + lhs + ", " + rhs + "))")
+        }
+
         function heapAccess(heap, addr, offset, shift) {
           return heap + "[(" + addr + "+" + offset + ")>>" + shift + "]"
         }
@@ -1809,7 +1829,7 @@
               break
 
             case OPCODES.I32_CONST:
-              pushLine(pushStackVar(TYPES.I32) + " = " + read_varint32())
+              pushLine(pushStackVar(TYPES.I32) + " = " + renderJSValue(read_varint32()))
               break
 
             case OPCODES.I64_CONST:
@@ -1818,11 +1838,11 @@
               break
 
             case OPCODES.F32_CONST:
-              pushLine(pushStackVar(TYPES.F32) + " = " + read_f32())
+              pushLine(pushStackVar(TYPES.F32) + " = " + renderJSValue(read_f32()))
               break
 
             case OPCODES.F64_CONST:
-              pushLine(pushStackVar(TYPES.F64) + " = " + read_f64())
+              pushLine(pushStackVar(TYPES.F64) + " = " + renderJSValue(read_f64()))
               break
 
             case OPCODES.I32_EQZ:
@@ -2107,6 +2127,68 @@
               i64_binaryFunc("irotr64")
               break
 
+            case OPCODES.F32_ABS:
+              f32_unaryOp("f32_abs")
+              break
+
+            case OPCODES.F32_NEG:
+              f32_unaryOp("-")
+              break
+
+            case OPCODES.F32_CEIL:
+              f32_unaryOp("f32_ceil")
+              break
+
+            case OPCODES.F32_FLOOR:
+              f32_unaryOp("f32_floor")
+              break
+
+            case OPCODES.F32_TRUNC:
+              f32_unaryOp("f32_trunc")
+              break
+
+            case OPCODES.F32_NEAREST:
+              f32_unaryOp("f32_nearest")
+              break
+
+            case OPCODES.F32_SQRT:
+              f32_unaryOp("f32_sqrt")
+              break
+
+            case OPCODES.F32_ADD:
+              f32_binaryOp("+")
+              break
+
+            case OPCODES.F32_SUB:
+              f32_binaryOp("-")
+              break
+
+            case OPCODES.F32_MUL:
+              f32_binaryOp("*")
+              break
+
+            case OPCODES.F32_DIV:
+              f32_binaryOp("/")
+              break
+
+            case OPCODES.F32_MIN:
+              f32_binaryFunc("f32_min")
+              break
+
+            case OPCODES.F32_MAX:
+              f32_binaryFunc("f32_max")
+              break
+
+            case OPCODES.F32_COPYSIGN:
+              f32_binaryFunc("f32_copysign")
+              break
+
+            case OPCODES.I32_REINTERPRET_F32:
+              var operand = popStackVar(TYPES.F32)
+              var output = pushStackVar(TYPES.I32)
+              pushLine(output + " = ToF32(" + operand + ")|0")
+              break
+
             default:
               throw new CompileError("unsupported opcode: 0x" + op.toString(16))
           }
@@ -2225,6 +2307,30 @@
     src.push("var ipopcnt64 = function(v) {")
     src.push("  return Long.fromNumber(popcnt32(v.getHighBits()) + popcnt32(v.getLowBits()))")
     src.push("}")
+    src.push("var ToF32 = Math.fround")
+    src.push("var f32_min = Math.min")
+    src.push("var f32_max = Math.max")
+    src.push("var f32_abs = Math.abs")
+    src.push("var f32_sqrt = Math.sqrt")
+    src.push("var f32_floor = Math.floor")
+    src.push("var f32_ceil = Math.ceil")
+    src.push("var f32_trunc = Math.trunc")
+    src.push("var f32_nearest = function (v) {")
+    src.push("  // ties to even...")
+    src.push("  if (Math.abs(v - Math.trunc(v)) === 0.5) { return 2 * Math.round(v / 2) }")
+    src.push("  return Math.round(v)")
+    src.push("}")
+    src.push("var scratchBuf = new ArrayBuffer(8)")
+    src.push("var scratchBytes = new Uint8Array(scratchBuf)")
+    src.push("var scratchData = new DataView(scratchBuf)")
+    src.push("var f32_signof = function(v) {")
+    src.push("  if (isNaN) {")
+    src.push("    scratchData.setFloat32(0, v, true)")
+    src.push("    return (scratchBytes[3] & 0x80) ? -1 : 1")
+    src.push("  }")
+    src.push("  return (y > 0 || 1 / y > 0) ? 1 : -1")
+    src.push("}")
+    src.push("var f32_copysign = function(x, y) { return f32_signof(y) * Math.abs(x) }")
 
     // Pull in various imports.
 
@@ -2411,6 +2517,31 @@
       }
     }
     return null
+  }
+
+  var scratchBuf = new ArrayBuffer(8)
+  var scratchBytes = new Uint8Array(scratchBuf)
+  var scratchData = new DataView(scratchBuf)
+
+  function renderJSValue(v) {
+    // We need to preserve two things that don't round-trip through v.toString():
+    //  * the distinction between -0 and 0
+    //  * the precise bit-pattern of an NaN
+    if (typeof v === "number") {
+      if (isNaN(v)) {
+        scratchData.setFloat64(0, v, true)
+        return "WebAssembly._fromNaNBytes([" + scratchBytes.join(",") + "])"
+      }
+      return ((v < 0 || 1 / v < 0) ? "-" : "") + Math.abs(v)
+    }
+    return "" + v
+  }
+
+  function _fromNaNBytes(bytes) {
+    for (var i = 0; i < 8; i++) {
+      scratchBytes[i] = bytes[i]
+    }
+    return scratchData.getFloat64(0, true)
   }
 
   return WebAssembly
