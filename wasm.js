@@ -1897,43 +1897,43 @@
               break
 
             case OPCODES.I64_EQ:
-              i64_compareFunc("ieq64")
+              i64_compareFunc("i64_eq")
               break
 
             case OPCODES.I64_NE:
-              i64_compareFunc("ine64")
+              i64_compareFunc("i64_ne")
               break
 
             case OPCODES.I64_LT_S:
-              i64_compareFunc("ilt64_s")
+              i64_compareFunc("i64_lt_s")
               break
 
             case OPCODES.I64_LT_U:
-              i64_compareFunc("ilt64_u")
+              i64_compareFunc("i64_lt_u")
               break
 
             case OPCODES.I64_GT_S:
-              i64_compareFunc("igt64_s")
+              i64_compareFunc("i64_gt_s")
               break
 
             case OPCODES.I64_GT_U:
-              i64_compareFunc("igt64_u")
+              i64_compareFunc("i64_gt_u")
               break
 
             case OPCODES.I64_LE_S:
-              i64_compareFunc("ile64_s")
+              i64_compareFunc("i64_le_s")
               break
 
             case OPCODES.I64_LE_U:
-              i64_compareFunc("ile64_u")
+              i64_compareFunc("i64_le_u")
               break
 
             case OPCODES.I64_GE_S:
-              i64_compareFunc("ige64_s")
+              i64_compareFunc("i64_ge_s")
               break
 
             case OPCODES.I64_GE_U:
-              i64_compareFunc("ige64_u")
+              i64_compareFunc("i64_ge_u")
               break
 
             case OPCODES.F32_EQ:
@@ -1961,15 +1961,15 @@
               break
 
             case OPCODES.I32_CLZ:
-              i32_unaryOp("clz32")
+              i32_unaryOp("i32_clz")
               break
 
             case OPCODES.I32_CTZ:
-              i32_unaryOp("ctz32")
+              i32_unaryOp("i32_ctz")
               break
 
             case OPCODES.I32_POPCNT:
-              i32_unaryOp("popcnt32")
+              i32_unaryOp("i32_popcnt")
               break
 
             case OPCODES.I32_ADD:
@@ -1981,7 +1981,7 @@
               break
 
             case OPCODES.I32_MUL:
-              i32_binaryFunc("imul32")
+              i32_binaryFunc("i32_mul")
               break
 
             case OPCODES.I32_DIV_S:
@@ -2038,35 +2038,35 @@
               break
 
             case OPCODES.I32_ROTL:
-              i32_binaryFunc("rotl")
+              i32_binaryFunc("i32_rotl")
               break
 
             case OPCODES.I32_ROTR:
-              i32_binaryFunc("rotr")
+              i32_binaryFunc("i32_rotr")
               break
 
             case OPCODES.I64_CLZ:
-              i64_unaryFunc("iclz64")
+              i64_unaryFunc("i64_clz")
               break
 
             case OPCODES.I64_CTZ:
-              i64_unaryFunc("ictz64")
+              i64_unaryFunc("i64_ctz")
               break
 
             case OPCODES.I64_POPCNT:
-              i64_unaryFunc("ipopcnt64")
+              i64_unaryFunc("i64_popcnt")
               break
 
             case OPCODES.I64_ADD:
-              i64_binaryFunc("iadd64")
+              i64_binaryFunc("i64_add")
               break
 
             case OPCODES.I64_SUB:
-              i64_binaryFunc("isub64")
+              i64_binaryFunc("i64_sub")
               break
 
             case OPCODES.I64_MUL:
-              i64_binaryFunc("imul64")
+              i64_binaryFunc("i64_mul")
               break
 
             case OPCODES.I64_DIV_S:
@@ -2074,57 +2074,57 @@
               var lhs = getStackVar(TYPES.I64, 1)
               pushLine("if (" + rhs + ".isZero()) { return trap() }")
               pushLine("if (" + lhs + ".eq(Long.MIN_VALUE) && " + rhs + ".eq(Long.NEG_ONE)) { return trap() }")
-              i64_binaryFunc("idiv64_s")
+              i64_binaryFunc("i64_div_s")
               break
 
             case OPCODES.I64_DIV_U:
               var rhs = getStackVar(TYPES.I64)
               pushLine("if (" + rhs + ".isZero()) { return trap() }")
-              i64_binaryFunc("idiv64_u")
+              i64_binaryFunc("i64_div_u")
               break
 
             case OPCODES.I64_REM_S:
               var rhs = getStackVar(TYPES.I64)
               pushLine("if (" + rhs + ".isZero()) { return trap() }")
-              i64_binaryFunc("irem64_s")
+              i64_binaryFunc("i64_rem_s")
               break
 
             case OPCODES.I64_REM_U:
               var rhs = getStackVar(TYPES.I64)
               pushLine("if (" + rhs + ".isZero()) { return trap() }")
-              i64_binaryFunc("irem64_u")
+              i64_binaryFunc("i64_rem_u")
               break
 
             case OPCODES.I64_AND:
-              i64_binaryFunc("iand64")
+              i64_binaryFunc("i64_and")
               break
 
             case OPCODES.I64_OR:
-              i64_binaryFunc("ior64")
+              i64_binaryFunc("i64_or")
               break
 
             case OPCODES.I64_XOR:
-              i64_binaryFunc("ixor64")
+              i64_binaryFunc("i64_xor")
               break
 
             case OPCODES.I64_SHL:
-              i64_binaryFunc("ishl64")
+              i64_binaryFunc("i64_shl")
               break
 
             case OPCODES.I64_SHR_S:
-              i64_binaryFunc("ishr64_s")
+              i64_binaryFunc("i64_shr_s")
               break
 
             case OPCODES.I64_SHR_U:
-              i64_binaryFunc("ishr64_u")
+              i64_binaryFunc("i64_shr_u")
               break
 
             case OPCODES.I64_ROTL:
-              i64_binaryFunc("irotl64")
+              i64_binaryFunc("i64_rotl")
               break
 
             case OPCODES.I64_ROTR:
-              i64_binaryFunc("irotr64")
+              i64_binaryFunc("i64_rotr")
               break
 
             case OPCODES.F32_ABS:
@@ -2237,8 +2237,9 @@
 
     // Import all the things from the stdlib.
 
+    src.push("const Long = WebAssembly._Long")
     Object.keys(stdlib).forEach(function(key) {
-      src.push("  const " + key + " = stdlib." + key)
+      src.push("const " + key + " = stdlib." + key)
     })
 
     // Pull in various imports.
@@ -2370,11 +2371,11 @@
   stdlib.trap = function() { throw new WebAssembly.RuntimeError() }
 
   // i32 operations that are not primitive operators
-  stdlib.imul32 = Math.imul
-  stdlib.clz32 = Math.clz32
-  stdlib.rotl32 = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}
-  stdlib.rotr32 = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}
-  stdlib.ctz32 = function(v) {
+  stdlib.i32_mul = Math.imul
+  stdlib.i32_clz = Math.clz32
+  stdlib.i32_rotl = function(v, n) { return ((v << n) | (v >>> (32 - n)) )|0}
+  stdlib.i32_rotr = function(v, n) { return ((v >>> n) | (v << (32 - n)) )|0}
+  stdlib.i32_ctz = function(v) {
     v = v|0
     var count = 0
     var bit = 0x01
@@ -2384,7 +2385,7 @@
     }
     return count
   }
-  stdlib.popcnt32 = function(v) {
+  stdlib.i32_popcnt = function(v) {
     v = v|0
     var count = 0
     var bit = 0x01
@@ -2396,47 +2397,47 @@
   }
 
   // i64 operations
-  stdlib.iadd64 = function(lhs, rhs) { return lhs.add(rhs) }
-  stdlib.isub64 = function(lhs, rhs) { return lhs.sub(rhs) }
-  stdlib.imul64 = function(lhs, rhs) { return lhs.mul(rhs) }
-  stdlib.idiv64_s = function(lhs, rhs) { return lhs.div(rhs) }
-  stdlib.idiv64_u = function(lhs, rhs) { return lhs.toUnsigned().div(rhs.toUnsigned().toUnsigned()) }
-  stdlib.irem64_s = function(lhs, rhs) { return lhs.mod(rhs) }
-  stdlib.irem64_u = function(lhs, rhs) { return lhs.toUnsigned().mod(rhs.toUnsigned()).toUnsigned().toSigned() }
-  stdlib.iand64 = function(lhs, rhs) { return lhs.and(rhs) }
-  stdlib.ior64 = function(lhs, rhs) { return lhs.or(rhs) }
-  stdlib.ixor64 = function(lhs, rhs) { return lhs.xor(rhs) }
-  stdlib.ishl64 = function(lhs, rhs) { return lhs.shl(rhs) }
-  stdlib.ishr64_s = function(lhs, rhs) { return lhs.shr(rhs) }
-  stdlib.ishr64_u = function(lhs, rhs) { return lhs.shru(rhs) }
-  stdlib.ieq64 = function(lhs, rhs) { return lhs.eq(rhs) }
-  stdlib.ine64 = function(lhs, rhs) { return lhs.neq(rhs) }
-  stdlib.ilt64_s = function(lhs, rhs) { return lhs.lt(rhs) }
-  stdlib.ilt64_u = function(lhs, rhs) { return lhs.toUnsigned().lt(rhs.toUnsigned()) }
-  stdlib.igt64_s = function(lhs, rhs) { return lhs.gt(rhs) }
-  stdlib.igt64_u = function(lhs, rhs) { return lhs.toUnsigned().gt(rhs.toUnsigned()) }
-  stdlib.ile64_s = function(lhs, rhs) { return lhs.lte(rhs) }
-  stdlib.ile64_u = function(lhs, rhs) { return lhs.toUnsigned().lte(rhs.toUnsigned()) }
-  stdlib.ige64_s = function(lhs, rhs) { return lhs.gte(rhs) }
-  stdlib.ige64_u = function(lhs, rhs) { return lhs.toUnsigned().gte(rhs.toUnsigned()) }
-  stdlib.irotl64 = function(v, n) { return v.shl(n).or(v.shru(Long.fromNumber(64).sub(n)))}
-  stdlib.irotr64 = function(v, n) { return v.shru(n).or(v.shl(Long.fromNumber(64).sub(n)))}
-  stdlib.iclz64 = function(v) {
-    var count = clz32(v.getHighBits())
+  stdlib.i64_add = function(lhs, rhs) { return lhs.add(rhs) }
+  stdlib.i64_sub = function(lhs, rhs) { return lhs.sub(rhs) }
+  stdlib.i64_mul = function(lhs, rhs) { return lhs.mul(rhs) }
+  stdlib.i64_div_s = function(lhs, rhs) { return lhs.div(rhs) }
+  stdlib.i64_div_u = function(lhs, rhs) { return lhs.toUnsigned().div(rhs.toUnsigned().toUnsigned()) }
+  stdlib.i64_rem_s = function(lhs, rhs) { return lhs.mod(rhs) }
+  stdlib.i64_rem_u = function(lhs, rhs) { return lhs.toUnsigned().mod(rhs.toUnsigned()).toUnsigned().toSigned() }
+  stdlib.i64_and = function(lhs, rhs) { return lhs.and(rhs) }
+  stdlib.i64_or = function(lhs, rhs) { return lhs.or(rhs) }
+  stdlib.i64_xor = function(lhs, rhs) { return lhs.xor(rhs) }
+  stdlib.i64_shl = function(lhs, rhs) { return lhs.shl(rhs) }
+  stdlib.i64_shr_s = function(lhs, rhs) { return lhs.shr(rhs) }
+  stdlib.i64_shr_u = function(lhs, rhs) { return lhs.shru(rhs) }
+  stdlib.i64_eq = function(lhs, rhs) { return lhs.eq(rhs) }
+  stdlib.i64_ne = function(lhs, rhs) { return lhs.neq(rhs) }
+  stdlib.i64_lt_s = function(lhs, rhs) { return lhs.lt(rhs) }
+  stdlib.i64_lt_u = function(lhs, rhs) { return lhs.toUnsigned().lt(rhs.toUnsigned()) }
+  stdlib.i64_gt_s = function(lhs, rhs) { return lhs.gt(rhs) }
+  stdlib.i64_gt_u = function(lhs, rhs) { return lhs.toUnsigned().gt(rhs.toUnsigned()) }
+  stdlib.i64_le_s = function(lhs, rhs) { return lhs.lte(rhs) }
+  stdlib.i64_le_u = function(lhs, rhs) { return lhs.toUnsigned().lte(rhs.toUnsigned()) }
+  stdlib.i64_ge_s = function(lhs, rhs) { return lhs.gte(rhs) }
+  stdlib.i64_ge_u = function(lhs, rhs) { return lhs.toUnsigned().gte(rhs.toUnsigned()) }
+  stdlib.i64_rotl = function(v, n) { return v.shl(n).or(v.shru(Long.fromNumber(64).sub(n)))}
+  stdlib.i64_rotr = function(v, n) { return v.shru(n).or(v.shl(Long.fromNumber(64).sub(n)))}
+  stdlib.i64_clz = function(v) {
+    var count = stdlib.i32_clz(v.getHighBits())
     if (count === 32) {
-      count += clz32(v.getLowBits())
+      count += stdlib.i32_clz(v.getLowBits())
     }
     return Long.fromNumber(count)
   }  
-  stdlib.ictz64 = function(v) {
-    var count = ctz32(v.getLowBits())
+  stdlib.i64_ctz = function(v) {
+    var count = stdlib.i32_ctz(v.getLowBits())
     if (count === 32) {
-      count += ctz32(v.getHighBits())
+      count += stdlib.i32_ctz(v.getHighBits())
     }
     return Long.fromNumber(count)
   }
-  stdlib.ipopcnt64 = function(v) {
-    return Long.fromNumber(popcnt32(v.getHighBits()) + popcnt32(v.getLowBits()))
+  stdlib.i64_popcnt = function(v) {
+    return Long.fromNumber(stdlib.i32_popcnt(v.getHighBits()) + stdlib.i32_popcnt(v.getLowBits()))
   }
 
   // f32 operations
