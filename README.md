@@ -20,3 +20,9 @@ We have:
   * `make test TESTS=<pattern>`:  run specific tests from the suite
 
 
+---
+
+Things that are awkward/weird/slow:
+
+  * Preserving the specific bit pattern in a NaN
+     * Worse, preserving the signalling bit of a NaN
