@@ -1169,6 +1169,9 @@
         var cfStack = [{
           op: 0,
           sig: 0, // XXX TODO: use function return sig?
+          isDead: false,
+          isPolymorphic: false,
+          endReached: false,
           typeStack: [],
           prevStackHeights: {}
         }]
@@ -1180,12 +1183,12 @@
         function printStack() {
           dump("--")
           for (var i = cfStack.length - 1; i >= 0; i--) {
-            dump(cfStack[i].polymorphic ? "*" : "-", cfStack[i].typeStack)
+            dump(cfStack[i].isDead ? "x" : "-", cfStack[i].typeStack)
           }
           dump("--")
         }
 
-        function pushControlFlow(op, sig) {
+        function pushControlFlow(op, sig, endReached) {
           var prevCf = cfStack[cfStack.length - 1]
           var prevStackHeights = {}
           prevStackHeights[TYPES.I32] = prevCf.prevStackHeights[TYPES.I32]
@@ -1200,18 +1203,13 @@
             sig: sig,
             index: cfStack.length,
             label: "L" + cfStack.length,
-            polymorphic: false,
-            endReached: false,
+            isPolymorphic: false,
+            isDead: prevCf.isDead,
+            endReached: !!endReached,
             typeStack: [],
             prevStackHeights: prevStackHeights
           })
           return cfStack[cfStack.length - 1]
-        }
-
-        function goPolymorphic() {
-          var cf = cfStack[cfStack.length - 1]
-          cf.polymorphic = true
-          cf.typeStack = []
         }
 
         function popControlFlow() {
@@ -1219,8 +1217,19 @@
           return cf
         }
 
+        function markDeadCode() {
+          var cf = cfStack[cfStack.length - 1]
+          cf.isDead = true
+          cf.isPolymorphic = true
+          cf.typeStack = []
+        }
+
+        function isDeadCode() {
+          return cfStack[cfStack.length - 1].isDead
+        }
+
         function pushLine(ln, indent) {
-          //if (deadCodeZone) { return }
+          //if (isDeadCode) { return }
           var indent = cfStack.length + (indent || 0) + 1
           while (indent > 0) {
             ln = "  " + ln
@@ -1238,7 +1247,7 @@
           var cf = cfStack[cfStack.length - 1]
           var stack = cf.typeStack
           if (stack.length === 0) {
-            if (! cf.polymorphic) {
+            if (! cf.isPolymorphic) {
               throw new CompileError("nothing on the stack")
             }
             return TYPES.UNKNOWN
@@ -1250,8 +1259,8 @@
           var name = getStackVar()
           var cf = cfStack[cfStack.length - 1]
           var typ = cf.typeStack.pop()
-          if (wantType && typ !== wantType) {
-            if (! cf.polymorphic) {
+          if (wantType && typ !== wantType && typ !== TYPES.UNKNOWN) {
+            if (! cf.isPolymorphic) {
               throw new CompileError("Stack type mismatch: expected, " + wantType + ", found " + typ)
             }
             return "UNDEFINED"
@@ -1264,7 +1273,7 @@
           var where = cf.typeStack.length - 1
           where -= (pos || 0)
           if (where < 0) {
-            if (! cf.polymorphic) {
+            if (! cf.isPolymorphic) {
               throw new CompileError("stack access outside current block")
             }
             return "UNREACHABLE"
@@ -1479,15 +1488,13 @@
           pushLine(pushStackVar(TYPES.I64) + " = new Long(" + low32 + ", " + high32 + ", true)")
         }
 
-        var deadCodeZone = false
-
         DECODE: while (true) {
           var op = read_byte()
           switch (op) {
 
             case OPCODES.UNREACHABLE:
               pushLine("return trap()")
-              deadCodeZone = true
+              markDeadCode()
               break
 
             case OPCODES.NOP:
@@ -1517,30 +1524,33 @@
               // left precisely one value, of correct type, on the stack.
               // The push/pop here resets stack state between the two branches.
               var cf = popControlFlow()
-              if (! deadCodeZone) {
-                cf.endReached = true
-              }
               if (cf.op !== OPCODES.IF) {
                 throw new CompileError("ELSE outside of IF")
               }
-              // XXX TODO: don't emit the `else` if the entire `if` was dead code
-              deadCodeZone = false
+              if (! cf.isDead) {
+                cf.endReached = true
+              }
               pushLine("} while (0) } else { "+ cf.label + ": do{")
-              pushControlFlow(cf.op, cf.sig)
+              pushControlFlow(cf.op, cf.sig, cf.endReached)
               break
 
             case OPCODES.END:
               if (cfStack.length === 1) {
                 // End of the entire function.
-                deadCodeZone = false
-                f.sig.return_types.forEach(function(typ) {
-                  pushLine("return " + popStackVar(typ))
-                })
+                if (f.sig.return_types.length === 0) {
+                  if (cfStack[0].typeStack.length > 0) {
+                    throw new CompileError("void function left something on the stack")
+                  }
+                  pushLine("return")
+                } else {
+                  pushLine("return " + popStackVar(f.sig.return_types[0]))
+                }
                 break DECODE
               } else {
                 // End of a control block
                 var cf = cfStack[cfStack.length - 1]
-                if (! deadCodeZone) {
+                pushLine("// ENDING " + JSON.stringify(cf))
+                if (! cf.isDead) {
                   cf.endReached = true
                 } else if (cf.endReached && cf.sig !== TYPES.NONE) {
                   // We're reached by a branch, but not by fall-through,
@@ -1558,10 +1568,7 @@
                   }
                 }
                 popControlFlow()
-                deadCodeZone = false
-                // Only push block result if *something* reaches the end
-                // of the block.  Otherwise, we remain in dead code mode.
-                if (cf.sig !== TYPES.NONE && cf.endReached) {
+                if (cf.sig !== TYPES.NONE) {
                   pushLine("  " + pushStackVar(cf.sig) + " = " + output)
                 }
                 switch (cf.op) {
@@ -1578,8 +1585,7 @@
                     throw new CompileError("Popped an unexpected control op")
                 }
                 if (! cf.endReached) {
-                  goPolymorphic()
-                  deadCodeZone = true
+                  markDeadCode()
                 }
               }
               break
@@ -1587,6 +1593,7 @@
             case OPCODES.BR:
               var depth = read_varuint32()
               var cf = getBranchTarget(depth)
+              pushLine("// BR TO " + JSON.stringify(cf))
               switch (cf.op) {
                 case OPCODES.BLOCK:
                 case OPCODES.IF:
@@ -1606,8 +1613,7 @@
                 default:
                   throw new CompileError("Branch to unsupported opcode")
               }
-              goPolymorphic()
-              deadCodeZone = true
+              markDeadCode()
               break
 
             case OPCODES.BR_IF:
@@ -1693,8 +1699,7 @@
                   break
               }
               pushLine("}")
-              goPolymorphic()
-              deadCodeZone = true
+              markDeadCode()
               break
 
             case OPCODES.RETURN:
@@ -1703,8 +1708,7 @@
               } else {
                 pushLine("return " + popStackVar(f.sig.return_types[0]))
               }
-              goPolymorphic()
-              deadCodeZone = true
+              markDeadCode()
               break
 
             case OPCODES.CALL:
