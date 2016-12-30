@@ -701,8 +701,11 @@
     // and doing some type-checking etc.  You can distinguish
     // primitive-value reads by being named read_XYZ()
 
-    function checkEndOfBytes() {
-      if (idx >= bytes.length) {
+    function checkEndOfBytes(count) {
+      if (typeof count === "undefined") {
+        count = 1
+      }
+      if ((idx + count) > bytes.length) {
         throw new CompileError("unepected end of bytes")
       }
     }
@@ -713,7 +716,7 @@
     }
 
     function read_bytes(count) {
-      checkEndOfBytes()
+      checkEndOfBytes(count)
       output = []
       while (count > 0) {
         output.push(String.fromCharCode(bytes[idx++]))
@@ -728,13 +731,13 @@
     }
 
     function read_uint16() {
-      checkEndOfBytes()
+      checkEndOfBytes(2)
       return (bytes[idx++]) |
              (bytes[idx++] << 8)
     }
 
     function read_uint32() {
-      checkEndOfBytes()
+      checkEndOfBytes(4)
       return (bytes[idx++]) |
              (bytes[idx++] << 8) |
              (bytes[idx++] << 16) |
@@ -950,6 +953,12 @@
     function parseMemoryType() {
       var m = {}
       m.limits = parseResizableLimits()
+      if (m.limits.initial > 65536) {
+        throw new CompileError("memory size great than 4GiB")
+      }
+      if (m.limits.maximum && m.limits.maximum > 65536) {
+        throw new CompileError("memory size great than 4GiB")
+      }
       return m
     }
 
@@ -959,6 +968,9 @@
       l.initial = read_varuint32()
       if (flags) {
         l.maximum = read_varuint32()
+        if (l.maximum < l.initial) {
+          throw new CompileError("maximum cannot be less than initial")
+        }
       } else {
         l.maximum = null
       }
@@ -1289,7 +1301,7 @@
         if (e.index !== 0) {
           throw new CompileError("MVP requires elements index be zero")
         }
-        // Check that it's a value table reference.
+        // Check that it's a valid table reference.
         getTableType(e.index)
         e.offset = parseInitExpr(TYPES.I32)
         var num_elems = read_varuint32()
@@ -1861,8 +1873,7 @@
 
         function i32_load16_u_unaligned(addr, offset, value) {
           var res = pushStackVar(TYPES.I32)
-          pushLine(res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
-          pushLine("if (" + res + " & 0x8000) { " + res + " |= (-1 << 16) }")
+          pushLine(res + " = HDV.getInt16(" + addr + " + " + offset + ", true) & 0x0000FFFF")
         }
 
         function i32_load16_s_aligned(addr, offset, value) {
@@ -1877,8 +1888,7 @@
         function i32_load16_u_aligned(addr, offset, value) {
           var res = pushStackVar(TYPES.I32)
           pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
-          pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
-          pushLine("  if (" + res + " & 0x8000) { " + res + " |= (-1 << 16) }")
+          pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true) & 0x0000FFFF")
           pushLine("} else {")
           pushLine("  " + res + " = HU16[(" + addr + " + " + offset + ")>>1]")
           pushLine("}")
@@ -2343,6 +2353,7 @@
               break
 
             case OPCODES.I32_LOAD:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2361,6 +2372,7 @@
               break
 
             case OPCODES.I64_LOAD:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               // Need two i32 vars, so create a temp one.
@@ -2387,6 +2399,7 @@
               break
 
             case OPCODES.F32_LOAD:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2405,6 +2418,7 @@
               break
 
             case OPCODES.F64_LOAD:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2424,7 +2438,11 @@
               break
 
             case OPCODES.I32_LOAD8_S:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
               boundsCheck(addr, offset, 1)
@@ -2432,7 +2450,11 @@
               break
 
             case OPCODES.I32_LOAD8_U:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
               boundsCheck(addr, offset, 1)
@@ -2440,6 +2462,7 @@
               break
 
             case OPCODES.I32_LOAD16_S:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2457,6 +2480,7 @@
               break
 
             case OPCODES.I32_LOAD16_U:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2474,7 +2498,11 @@
               break
 
             case OPCODES.I64_LOAD8_S:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
               boundsCheck(addr, offset, 1)
@@ -2483,7 +2511,11 @@
               break
 
             case OPCODES.I64_LOAD8_U:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
               boundsCheck(addr, offset, 1)
@@ -2492,6 +2524,7 @@
               break
 
             case OPCODES.I64_LOAD16_S:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2510,6 +2543,7 @@
               break
 
             case OPCODES.I64_LOAD16_U:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2528,6 +2562,7 @@
               break
 
             case OPCODES.I64_LOAD32_S:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2547,6 +2582,7 @@
               break
 
             case OPCODES.I64_LOAD32_U:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var addr = popStackVar(TYPES.I32)
@@ -2565,6 +2601,7 @@
               break
 
             case OPCODES.I32_STORE:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I32)
@@ -2584,7 +2621,7 @@
               break
 
             case OPCODES.I64_STORE:
-              pushLine("// I64_STORE")
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I64)
@@ -2607,6 +2644,7 @@
               break
 
             case OPCODES.F32_STORE:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.F32)
@@ -2626,6 +2664,7 @@
               break
 
             case OPCODES.F64_STORE:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.F64)
@@ -2646,7 +2685,11 @@
               break
 
             case OPCODES.I32_STORE8:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I32)
               var addr = popStackVar(TYPES.I32)
@@ -2655,6 +2698,7 @@
               break
 
             case OPCODES.I32_STORE16:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I32)
@@ -2674,7 +2718,11 @@
               break
 
             case OPCODES.I64_STORE8:
+              getMemoryType(0)
               var flags = read_varuint32()
+              if (flags > 0) {
+                throw new CompileError("alignment larger than natural")
+              }
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I64)
               var addr = popStackVar(TYPES.I32)
@@ -2683,6 +2731,7 @@
               break
 
             case OPCODES.I64_STORE16:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I64)
@@ -2702,6 +2751,7 @@
               break
 
             case OPCODES.I64_STORE32:
+              getMemoryType(0)
               var flags = read_varuint32()
               var offset = read_varuint32()
               var value = popStackVar(TYPES.I64)
@@ -2727,12 +2777,20 @@
               break
 
             case OPCODES.CURRENT_MEMORY:
-              read_varuint1()
-              pushLine(pushStackVar(TYPES.I32) + " = currentMemory|0")
+              var mem_index = read_varuint1()
+              if (mem_index !== 0) {
+                throw new CompileError("only one memory in the MVP")
+              }
+              getMemoryType(mem_index)
+              pushLine(pushStackVar(TYPES.I32) + " = (memorySize / " + PAGE_SIZE + ")|0")
               break
 
             case OPCODES.GROW_MEMORY:
-              read_varuint1()
+              var mem_index = read_varuint1()
+              if (mem_index !== 0) {
+                throw new CompileError("only one memory in the MVP")
+              }
+              getMemoryType(mem_index)
               var operand = popStackVar(TYPES.I32)
               var res = pushStackVar(TYPES.I32)
               pushLine(res + " = M0._grow(" + operand + ")")
@@ -3392,6 +3450,8 @@
       if (d.index !== 0) {
         throw new CompileError("MVP requires data index be zero")
       }
+      // Check that it's a valid memory reference.
+      getMemoryType(d.index)
       d.offset = parseInitExpr(TYPES.I32)
       var size = read_varuint32()
       d.data = read_bytes(size)
@@ -3516,9 +3576,11 @@
 
     var datas = sections[SECTIONS.DATA] || []
     datas.forEach(function(d, idx) {
-      src.push("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('table out of bounds') }")
-      for (var i = 0; i < d.data.length; i++) {
-        src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
+      if (d.data.length > 0 ) {
+        src.push("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('memory out of bounds') }")
+        for (var i = 0; i < d.data.length; i++) {
+          src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
+        }
       }
     })
 
