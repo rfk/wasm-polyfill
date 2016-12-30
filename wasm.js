@@ -1839,7 +1839,7 @@
         }
 
         function boundsCheck(addr, offset, size) {
-          pushLine("if (" + addr + " + " + (offset + size) + " > memorySize) { return trap() }")
+          pushLine("if ((" + addr + ">>>0) + " + (offset + size) + " > memorySize) { return trap() }")
         }
 
         function i32_load_unaligned(addr, offset) {
