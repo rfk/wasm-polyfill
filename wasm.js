@@ -202,48 +202,54 @@
     this._exports = moduleObject._internals.jsmodule(imports, stdlib)
 
     this.exports = {}
-    var self = this
-    Object.keys(this._exports).forEach(function(key) {
-      var wasmFunc = self._exports[key]
-      if (!wasmFunc._wasmJSWrapper) {
-        wasmFunc._wasmJSWrapper = function () {
-          // Type-check and coerce arguments.
-          var args = []
-          ARGLOOP: for (var i = 0; i < wasmFunc._wasmTypeSigStr.length; i++) {
-            switch (wasmFunc._wasmTypeSigStr.charAt(i)) {
-              case 'i':
-                args.push(arguments[i]|0)
-                break
-              case 'l':
-                throw new RuntimeError("cannot pass i64 from js: " + arguments[i])
-              case 'f':
-                args.push(Math.fround(+arguments[i]))
-                break
-              case 'd':
-                args.push(+arguments[i])
-                break
-              case '-':
-                break ARGLOOP
-              default:
-                throw new RuntimeError("malformed _wasmTypeSigStr")
-            }
-          }
-          try {
-            return self._exports[key].apply(this, args)
-          } catch (err) {
-            // For test compatibilty, we want stack space exhaustion to trap.
-            // XXX TODO: this can't really be necessary in practice, right?
-            if (err instanceof RangeError) {
-              if (err.message.indexOf("call stack") >= 0) {
-                throw new RuntimeError("call stack exhausted")
+    var self = this;
+    (moduleObject._internals.sections[SECTIONS.EXPORT] || []).forEach(function(e) {
+      switch (e.kind) {
+        case EXTERNAL_KINDS.FUNCTION:
+          var wasmFunc = self._exports[e.field]
+          if (!wasmFunc._wasmJSWrapper) {
+            wasmFunc._wasmJSWrapper = function () {
+              // Type-check and coerce arguments.
+              var args = []
+              ARGLOOP: for (var i = 0; i < wasmFunc._wasmTypeSigStr.length; i++) {
+                switch (wasmFunc._wasmTypeSigStr.charAt(i)) {
+                  case 'i':
+                    args.push(arguments[i]|0)
+                    break
+                  case 'l':
+                    throw new RuntimeError("cannot pass i64 from js: " + arguments[i])
+                  case 'f':
+                    args.push(Math.fround(+arguments[i]))
+                    break
+                  case 'd':
+                    args.push(+arguments[i])
+                    break
+                  case '-':
+                    break ARGLOOP
+                  default:
+                    throw new RuntimeError("malformed _wasmTypeSigStr")
+                }
+              }
+              try {
+                return self._exports[e.field].apply(this, args)
+              } catch (err) {
+                // For test compatibilty, we want stack space exhaustion to trap.
+                // XXX TODO: this can't really be necessary in practice, right?
+                if (err instanceof RangeError) {
+                  if (err.message.indexOf("call stack") >= 0) {
+                    throw new RuntimeError("call stack exhausted")
+                  }
+                }
+                throw err
               }
             }
-            throw err
+            wasmFunc._wasmJSWrapper._wasmRawFunc = wasmFunc
           }
-        }
-        wasmFunc._wasmJSWrapper._wasmRawFunc = wasmFunc
+          self.exports[e.field] = wasmFunc._wasmJSWrapper
+          break
+        default:
+          self.exports[e.field] = self._exports[e.field]
       }
-      self.exports[key] = wasmFunc._wasmJSWrapper
     })
   }
 
@@ -1092,8 +1098,10 @@
     }
 
     function parseExportSection() {
+      var numImportedFunctions = getImportedFunctions().length
       var count = read_varuint32()
       var entries = []
+      var seenFields = {}
       while (count > 0) {
         entries.push(parseExportEntry())
         count--
@@ -1104,8 +1112,36 @@
         var e = {}
         var field_len = read_varuint32()
         e.field = read_bytes(field_len)
+        if (e.field in seenFields) {
+          throw new CompileError("duplicate export name: " + e.field)
+        }
+        seenFields[e.field] = true
         e.kind = read_external_kind()
         e.index = read_varuint32()
+        switch (e.kind) {
+          case EXTERNAL_KINDS.FUNCTION:
+            if (e.index >= (sections[SECTIONS.FUNCTION]||[]).length + numImportedFunctions) {
+              throw new CompileError("export of non-existent function")
+            }
+            break
+          case EXTERNAL_KINDS.GLOBAL:
+            if (e.index >= (sections[SECTIONS.GLOBAL]||[]).length) {
+              throw new CompileError("export of non-existent global")
+            }
+            break
+          case EXTERNAL_KINDS.TABLE:
+            if (e.index >= (sections[SECTIONS.TABLE]||[]).length) {
+              throw new CompileError("export of non-existent table")
+            }
+            break
+          case EXTERNAL_KINDS.MEMORY:
+            if (e.index >= (sections[SECTIONS.MEMORY]||[]).length) {
+              throw new CompileError("export of non-existent memory")
+            }
+            break
+          default:
+            throw new CompileError("unchecked export kind: " + e.kind)
+        }
         // XXX TODO: early check that index is within bounds for relevant index space?
         return e
       }
@@ -2806,7 +2842,7 @@
               break
 
             case OPCODES.F32_NEG:
-              f32_unaryOp("-")
+              f32_unaryOp("f32_neg")
               break
 
             case OPCODES.F32_CEIL:
@@ -3196,7 +3232,7 @@
 
     var globals = sections[SECTIONS.GLOBAL] || []
     globals.forEach(function(g, idx) {
-      notImplemented()
+      src.push("var G" + idx + " = " + g.init.jsexpr)
     })
 
     // Render the code for each function.
@@ -3391,6 +3427,18 @@
       return scratchData.getFloat32(0, true)
     }
     return Math.abs(v)
+  }
+  stdlib.f32_neg = function (v) {
+    if (isNaN(v)) {
+      scratchData.setFloat32(0, v, true)
+      if (scratchBytes[3] & 0x80) {
+        scratchBytes[3] &= ~0x80
+      } else {
+        scratchBytes[3] |= 0x80
+      }
+      return scratchData.getFloat32(0, true)
+    }
+    return -v
   }
   stdlib.f32_signof = function(v) {
     if (isNaN(v)) {
