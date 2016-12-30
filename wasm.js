@@ -37,7 +37,7 @@
       var arg = arguments[i]
       if (typeof arg === 'string') {
         process.stderr.write(arg)
-      } else if (typeof arg === 'number' || (typeof arg === 'object' && isNaN(arg))) {
+      } else if (typeof arg === 'number' || (arg instanceof Number)) {
         process.stderr.write(renderJSValue(arg))
       } else {
         process.stderr.write(JSON.stringify(arg))
@@ -1027,6 +1027,9 @@
         switch (i.kind) {
           case EXTERNAL_KINDS.FUNCTION:
             i.type = read_varuint32()
+            if (i.type >= (sections[SECTIONS.TYPE] || []).length) {
+              throw new CompileError("import has unknown type: " + i.type)
+            }
             break
           case EXTERNAL_KINDS.TABLE:
             i.type = parseTableType()
@@ -1166,8 +1169,11 @@
         if (e.index !== 0) {
           throw new CompileError("MVP requires elements index be zero")
         }
+        if (e.index >= (sections[SECTIONS.TABLE] || []).length) {
+          throw new CompileError("Invalid table index: " + e.index)
+        }
         e.offset = parseInitExpr()
-        // XXX TODO: check tht initExpr is i32
+        // XXX TODO: check that initExpr is i32
         var num_elems = read_varuint32()
         e.elems = []
         while (num_elems > 0) {
@@ -1264,7 +1270,11 @@
         var f = {}
         // XXX TODO: check that the function entry exists
         f.name = "F" + (index + numImportedFunctions)
-        f.sig = sections[SECTIONS.TYPE][sections[SECTIONS.FUNCTION][index]]
+        var sig_index = sections[SECTIONS.FUNCTION][index]
+        if (sig_index >= (sections[SECTIONS.TYPE] || []).length) {
+          throw new CompileError("unknown function type: " + sig_index)
+        }
+        f.sig = sections[SECTIONS.TYPE][sig_index]
         f.sigStr = makeSigStr(f.sig)
         var body_size = read_varuint32()
         var end_of_body_idx = idx + body_size
