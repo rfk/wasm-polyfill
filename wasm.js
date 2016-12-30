@@ -1573,7 +1573,7 @@
             if (! cf.isPolymorphic) {
               throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + typ)
             }
-            return "UNDEFINED"
+            return "UNREACHABLE"
           }
           return name
         }
@@ -1588,7 +1588,7 @@
             }
             return "UNREACHABLE"
           }
-          if (typ !== cf.typeStack[where] && typ !== TYPES.UNKNOWN) {
+          if (typ !== cf.typeStack[where] && typ !== TYPES.UNKNOWN && cf.typeStack[where] !== TYPES.UNKNOWN) {
             throw new CompileError("Stack type mismatch: expected " + typ + ", found " + cf.typeStack[where])
           }
           var height = cf.prevStackHeights[typ]
