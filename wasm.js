@@ -151,7 +151,7 @@
   }
 
   // XXX TODO: Module needs to be cloneable.
-  // How to make this so?
+  // How to make this so?  Is it even possible in a sensible fashion?
 
   //
   // The `Instance` object.
@@ -166,30 +166,60 @@
       }
     }
     // Collect, type-check and coerce the imports.
-    var importDefs = moduleObject._internals.sections[SECTIONS.IMPORT] || []
-    var imports = []
-    importDefs.forEach(function(i) {
+    var sections = moduleObject._internals.sections
+    var imports = [];
+    (sections[SECTIONS.IMPORT] || []).forEach(function(i) {
       var o = importObject[i.module_name]
       assertIsInstance(o, Object)
       var v = o[i.item_name]
+      if (typeof v === "undefined") {
+        throw new TypeError("cannot import undefined")
+      }
       switch(i.kind) {
         case EXTERNAL_KINDS.FUNCTION:
           assertIsCallable(v)
-          if (v._wasmRawFunc) {
-            imports.push(v._wasmRawFunc)
-          } else {
+          // If importing functions from another WASM instance,
+          // we can shortcut *and* we can do more typechecking.
+          if (! v._wasmRawFunc) {
             imports.push(v)
+          } else {
+            if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(sections[SECTIONS.TYPE][i.type])) {
+              throw new TypeError("function import type mis-match")
+            }
+            imports.push(v._wasmRawFunc)
           }
           break
         case EXTERNAL_KINDS.GLOBAL:
-          imports.push(ToWebAssemblyValue(v), i.kind)
+          imports.push(ToWebAssemblyValue(v, i.type.content_type))
           break
         case EXTERNAL_KINDS.MEMORY:
-          assertInstanceOf(v, Memory)
+          assertIsInstance(v, Memory)
+          if (v._internals.current < i.type.limits.initial) {
+            throw new TypeError("memory import too small")
+          }
+          if (i.type.limits.maximum) {
+            if (v._internals.current > i.type.limits.maximum) {
+              throw new TypeError("memory import too big")
+            }
+            if (!v._internals.maximum || v._internals.maximum > i.type.limits.maximum) {
+              throw new TypeError("memory import has too large a maximum")
+            }
+          }
           imports.push(v)
           break
         case EXTERNAL_KINDS.TABLE:
-          assertInstanceOf(v, Table)
+          assertIsInstance(v, Table)
+          if (v.length < i.type.limits.initial) {
+            throw new TypeError("table import too small")
+          }
+          if (i.type.limits.maximum) {
+            if (v.length > i.type.limits.maximum) {
+              throw new TypeError("table import too big")
+            }
+            if (!v._internals.maximum || v._internals.maximum > i.type.limits.maximum) {
+              throw new TypeError("table import has too large a maximum")
+            }
+          }
           imports.push(v)
           break
         default:
@@ -1036,6 +1066,9 @@
       return entries
     }
 
+    var hasTable = false
+    var hasMemory = false
+
     function parseImportSection() {
       var count = read_varuint32()
       var entries = []
@@ -1060,9 +1093,17 @@
             }
             break
           case EXTERNAL_KINDS.TABLE:
+            if (hasTable) {
+              throw new CompileError("multiple tables")
+            }
+            hasTable = true
             i.type = parseTableType()
             break
           case EXTERNAL_KINDS.MEMORY:
+            if (hasMemory) {
+              throw new CompileError("multiple memories")
+            }
+            hasMemory = true
             i.type = parseMemoryType()
             break
           case EXTERNAL_KINDS.GLOBAL:
@@ -1092,6 +1133,10 @@
       var count = read_varuint32()
       var entries = []
       while (count > 0) {
+        if (hasTable) {
+          throw new CompileError("multiple tables")
+        }
+        hasTable = true
         entries.push(parseTableType())
         count--
       }
@@ -1105,6 +1150,10 @@
       var count = read_varuint32()
       var entries = []
       while (count > 0) {
+        if (hasMemory) {
+          throw new CompileError("multiple memories")
+        }
+        hasMemory = true
         entries.push(parseMemoryType())
         count--
       }
@@ -1204,9 +1253,8 @@
         if (e.index !== 0) {
           throw new CompileError("MVP requires elements index be zero")
         }
-        if (e.index >= (sections[SECTIONS.TABLE] || []).length) {
-          throw new CompileError("Invalid table index: " + e.index)
-        }
+        // Check that it's a value table reference.
+        getTableType(e.index)
         e.offset = parseInitExpr(TYPES.I32)
         var num_elems = read_varuint32()
         e.elems = []
@@ -1240,6 +1288,55 @@
       return importedGlobals
     }
 
+    function getImportedTables() {
+      var imports = sections[SECTIONS.IMPORT] || []
+      var importedTables = []
+      imports.forEach(function(i, index) {
+        if (i.kind === EXTERNAL_KINDS.TABLE) {
+          importedTables.push(i.type)
+        }
+      })
+      return importedTables
+    }
+
+    function getImportedMemories() {
+      var imports = sections[SECTIONS.IMPORT] || []
+      var importedMemories = []
+      imports.forEach(function(i, index) {
+        if (i.kind === EXTERNAL_KINDS.MEMORY) {
+          importedMemories.push(i.type)
+        }
+      })
+      return importedMemories
+    }
+
+    function getGlobalType(index) {
+      var globals = getImportedGlobals()
+      globals = globals.concat(sections[SECTIONS.GLOBAL] || [])
+      if (index >= globals.length) {
+        throw new CompileError("no such global: " + index)
+      }
+      return globals[index].type.content_type
+    }
+
+    function getTableType(index) {
+      var tables = getImportedTables()
+      tables = tables.concat(sections[SECTIONS.TABLE] || [])
+      if (index >= tables.length) {
+        throw new CompileError("no such table: " + index)
+      }
+      return tables[index]
+    }
+
+    function getMemoryType(index) {
+      var memories = getImportedMemories()
+      memories = memories.concat(sections[SECTIONS.MEMORY] || [])
+      if (index >= memories.length) {
+        throw new CompileError("no such memory: " + index)
+      }
+      return memories[index]
+    }
+
     function getFunctionSignature(index) {
       var count = 0
       var imports = sections[SECTIONS.IMPORT] || []
@@ -1267,32 +1364,6 @@
         throw new CompileError("Invalid type index: " + index)
       }
       return typeSection[index]
-    }
-
-    function makeSigStr(funcSig) {
-      var typeCodes = []
-      function typeCode(typ) {
-        switch (typ) {
-          case TYPES.I32:
-            return "i"
-          case TYPES.I64:
-            return "l"
-          case TYPES.F32:
-            return "f"
-          case TYPES.F64:
-            return "d"
-          default:
-            throw new CompileError("unexpected type: " + typ)
-        }
-      }
-      funcSig.param_types.forEach(function(typ) {
-        typeCodes.push(typeCode(typ))
-      })
-      typeCodes.push("->")
-      funcSig.return_types.forEach(function(typ) {
-        typeCodes.push(typeCode(typ))
-      })
-      return typeCodes.join("")
     }
 
     function parseCodeSection() {
@@ -1610,14 +1681,6 @@
             c.header_lines.push("    var " + nm + " = " + initVal)
             declaredVars[nm] = true
           }
-        }
-
-        function getGlobalType(index) {
-          var globals = sections[SECTIONS.GLOBAL] || []
-          if (index >= globals.length) {
-            throw new CompileError("no such global: " + index)
-          }
-          return globals[index].type.content_type
         }
 
         function getGlobalVar(index, typ) {
@@ -2156,9 +2219,7 @@
               if (table_index !== 0) {
                 throw new CompileError("MVP reserved-value constraint violation")
               }
-              if (!sections[SECTIONS.TABLE] || table_index >= sections[SECTIONS.TABLE].length) {
-                throw new CompileError("invalid table index")
-              }
+              getTableType(table_index) // check that the table exists
               var callSig = getTypeSignature(type_index)
               var callIdx = popStackVar(TYPES.I32)
               // The rightmost arg is the one on top of stack,
@@ -2628,7 +2689,7 @@
             case OPCODES.GROW_MEMORY:
               read_varuint1()
               popStackVar(TYPES.I32)
-              pushLine("trap() // grow_memory not implemented yet")
+              pushLine("trap('grow_memory not implemented yet')")
               pushStackVar(TYPES.I32)
               break
 
@@ -3310,6 +3371,8 @@
     var imports = sections[SECTIONS.IMPORT] || []
     var countFuncs = 0
     var countGlobals = 0
+    var countTables = 0
+    var countMemories = 0
     imports.forEach(function(i, idx) {
       switch (i.kind) {
         case EXTERNAL_KINDS.FUNCTION:
@@ -3320,6 +3383,14 @@
           src.push("var G" + countGlobals + " = imports[" + idx + "]")
           countGlobals++
           break
+        case EXTERNAL_KINDS.TABLE:
+          src.push("var T" + countTables + " = imports[" + idx + "]")
+          countTables++
+          break
+        case EXTERNAL_KINDS.MEMORY:
+          src.push("var M" + countMemories + " = imports[" + idx + "]")
+          countMemories++
+          break
         default:
           throw new CompileError("cannot render import kind: " + i.kind)
       }
@@ -3329,7 +3400,7 @@
 
     var tables = sections[SECTIONS.TABLE] || []
     tables.forEach(function(t, idx) {
-      src.push("var T" + idx + " = new WebAssembly.Table(" + JSON.stringify(t.limits) + ")")
+      src.push("var T" + (idx + countTables) + " = new WebAssembly.Table(" + JSON.stringify(t.limits) + ")")
     })
 
     // Create requested memory, and provide views into it.
@@ -3339,7 +3410,7 @@
       src.push("var M" + idx + " = new WebAssembly.Memory(" + JSON.stringify(m.limits) + ")")
     })
 
-    if (memories.length > 0) {
+    if (countMemories || memories.length > 0) {
       src.push("var memorySize = M0.buffer.byteLength")
       src.push("var HI8 = new Int8Array(M0.buffer)")
       src.push("var HI16 = new Int16Array(M0.buffer)")
@@ -3375,6 +3446,7 @@
 
     var elements = sections[SECTIONS.ELEMENT] || []
     elements.forEach(function(e, idx) {
+      src.push("if ((" + e.offset.jsexpr + " + " + e.elems.length + " - 1) >= T" + e.index + ".length) { throw new TypeError('table out of bounds') }")
       for (var i = 0; i < e.elems.length; i++) {
         src.push("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
       }
@@ -3385,6 +3457,7 @@
 
     var datas = sections[SECTIONS.DATA] || []
     datas.forEach(function(d, idx) {
+      src.push("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('table out of bounds') }")
       for (var i = 0; i < d.data.length; i++) {
         src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
       }
@@ -3701,7 +3774,7 @@
   }
 
   function assertIsInstance(obj, Cls) {
-    if (!obj instanceof Cls) {
+    if (!(obj instanceof Cls)) {
       throw new TypeError()
     }
   }
@@ -3720,17 +3793,20 @@
   }
 
   function ToWebAssemblyValue(jsValue, kind) {
+    if (typeof jsValue !== 'number' && ! (jsValue instanceof Number)) {
+      throw new TypeError("cant pass non-number in to WASM")
+    }
     switch (kind) {
-      case EXTERNAL_KINDS.I32:
+      case TYPES.I32:
         return jsValue|0
-      case EXTERNAL_KINDS.I64:
-        throw new TypeError()
-      case EXTERNAL_KINDS.F32:
+      case TYPES.I64:
+        return Long.fromNumber(jsValue)
+      case TYPES.F32:
         return stdlib.ToF32(jsValue)
-      case EXTERNAL_KINDS.F64:
+      case TYPES.F64:
         return +jsValue
       default:
-        throw new TypeError()
+        throw new TypeError("Unknown type: " + kind)
     }
   }
 
@@ -3793,6 +3869,32 @@
     }
     return v
   }
+
+  function makeSigStr(funcSig) {
+     var typeCodes = []
+     function typeCode(typ) {
+       switch (typ) {
+         case TYPES.I32:
+           return "i"
+         case TYPES.I64:
+           return "l"
+         case TYPES.F32:
+           return "f"
+         case TYPES.F64:
+           return "d"
+         default:
+           throw new CompileError("unexpected type: " + typ)
+       }
+     }
+     funcSig.param_types.forEach(function(typ) {
+       typeCodes.push(typeCode(typ))
+     })
+     typeCodes.push("->")
+     funcSig.return_types.forEach(function(typ) {
+       typeCodes.push(typeCode(typ))
+     })
+     return typeCodes.join("")
+   }
 
   return WebAssembly
 
