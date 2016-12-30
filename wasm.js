@@ -1651,7 +1651,11 @@
 
         function i32_load_aligned(addr, offset) {
           var res = pushStackVar(TYPES.I32)
-          pushLine(res + " = HI32[(" + addr + " + " + offset + ")>>2]")
+          pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+          pushLine("  " + res + " = HDV.getInt32(" + addr + " + " + offset + ", true)")
+          pushLine("} else {")
+          pushLine("  " + res + " = HI32[(" + addr + " + " + offset + ")>>2]")
+          pushLine("}")
         }
 
         function i32_load8_s(addr, offset, value) {
@@ -1677,12 +1681,21 @@
 
         function i32_load16_s_aligned(addr, offset, value) {
           var res = pushStackVar(TYPES.I32)
-          pushLine(res + " = HI16[(" + addr + " + " + offset + ")>>1]")
+          pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
+          pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
+          pushLine("} else {")
+          pushLine("  " + res + " = HI16[(" + addr + " + " + offset + ")>>1]")
+          pushLine("}")
         }
 
         function i32_load16_u_aligned(addr, offset, value) {
           var res = pushStackVar(TYPES.I32)
-          pushLine(res + " = HU16[(" + addr + " + " + offset + ")>>1]")
+          pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
+          pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
+          pushLine("  if (" + res + " & 0x8000) { " + res + " |= (-1 << 16) }")
+          pushLine("} else {")
+          pushLine("  " + res + " = HU16[(" + addr + " + " + offset + ")>>1]")
+          pushLine("}")
         }
 
         function i32_store_unaligned(addr, offset, value) {
@@ -1690,7 +1703,11 @@
         }
 
         function i32_store_aligned(addr, offset, value) {
-          pushLine("HI32[(" + addr + " + " + offset + ")>>2] = " + value)
+          pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+          pushLine("  HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
+          pushLine("} else {")
+          pushLine("  HI32[(" + addr + " + " + offset + ")>>2] = " + value)
+          pushLine("}")
         }
 
         function i32_store8(addr, offset, value) {
@@ -1698,25 +1715,41 @@
         }
 
         function i32_store16(addr, offset, value) {
-          pushLine("HU16[(" + addr + " + " + offset + ")>>1] = " + value)
+          pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
+          pushLine("  HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
+          pushLine("} else {")
+          pushLine("  HU16[(" + addr + " + " + offset + ")>>1] = " + value)
+          pushLine("}")
         }
 
         function f32_load_unaligned(addr, offset) {
           var res = pushStackVar(TYPES.F32)
           pushLine(res + " = HDV.getFloat32(" + addr + " + " + offset + ", true)")
+          pushLine(res + " = f32_load_fix_signalling(" + res + ", HU8, " + addr + " + " + offset + ")")
         }
 
         function f32_load_aligned(addr, offset) {
           var res = pushStackVar(TYPES.F32)
-          pushLine(res + " = HF32[(" + addr + " + " + offset + ")>>2]")
+          pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+          pushLine("  " + res + " = HDV.getFloat32(" + addr + " + " + offset + ", true)")
+          pushLine("} else {")
+          pushLine("  " + res + " = HF32[(" + addr + " + " + offset + ")>>2]")
+          pushLine("}")
+          pushLine(res + " = f32_load_fix_signalling(" + res + ", HU8, " + addr + " + " + offset + ")")
         }
 
         function f32_store_unaligned(addr, offset, value) {
           pushLine("HDV.setFloat32(" + addr + " + " + offset + ", " + value + ", true)")
+          pushLine("f32_store_fix_signalling(" + value + ", HU8, " + addr + " + " + offset + ")")
         }
 
         function f32_store_aligned(addr, offset, value) {
-          pushLine("HF32[(" + addr + " + " + offset + ")>>2] = " + value)
+          pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+          pushLine("  HDV.setFloat32(" + addr + " + " + offset + ", " + value + ", true)")
+          pushLine("} else {")
+          pushLine("  HF32[(" + addr + " + " + offset + ")>>2] = " + value)
+          pushLine("}")
+          pushLine("f32_store_fix_signalling(" + value + ", HU8, " + addr + " + " + offset + ")")
         }
 
         function f64_load_unaligned(addr, offset) {
@@ -1726,7 +1759,11 @@
 
         function f64_load_aligned(addr, offset) {
           var res = pushStackVar(TYPES.F64)
-          pushLine(res + " = HF64[(" + addr + " + " + offset + ")>>3]")
+          pushLine("if ((" + addr + " + " + offset + ") & 0x0FFF) {")
+          pushLine("  " + res + " = HDV.getFloat64(" + addr + " + " + offset + ", true)")
+          pushLine("} else {")
+          pushLine("  " + res + " = HF64[(" + addr + " + " + offset + ")>>3]")
+          pushLine("}")
         }
 
         function f64_store_unaligned(addr, offset, value) {
@@ -1734,7 +1771,11 @@
         }
 
         function f64_store_aligned(addr, offset, value) {
-          pushLine("HF64[(" + addr + " + " + offset + ")>>2] = " + value)
+          pushLine("if ((" + addr + " + " + offset + ") & 0x0FFF) {")
+          pushLine("  HDV.setFloat64(" + addr + " + " + offset + ", " + value + ", true)")
+          pushLine("} else {")
+          pushLine("  HF64[(" + addr + " + " + offset + ")>>3] = " + value)
+          pushLine("}")
         }
 
         function i64_from_i32_s() {
@@ -2979,7 +3020,7 @@
               pushLine("if (" + operand + " > UINT32_MAX) { return trap() }")
               pushLine("if (" + operand + " <= -1) { return trap() }")
               pushLine("if (isNaN(" + operand + ")) { return trap() }")
-              pushLine(output + " = (" + operand + ")>>>0")
+              pushLine(output + " = ((" + operand + ")>>>0)|0")
               break
 
             case OPCODES.I32_TRUNC_U_F64:
@@ -3474,6 +3515,22 @@
       }
     }
     return v
+  }
+  stdlib.f32_load_fix_signalling = function(v, HU8, addr) {
+    if (isNaN(v)) {
+      if (!(HU8[addr + 2] & 0x40)) {
+        v = new Number(v)
+        v._signalling = true
+      }
+    }
+    return v
+  }
+  stdlib.f32_store_fix_signalling = function(v, HU8, addr) {
+    if (isNaN(v)) {
+      if (typeof v === 'object' && v._signalling) {
+        HU8[addr + 2] &= ~0x40
+      }
+    }
   }
 
   // f64 operations
