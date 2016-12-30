@@ -180,8 +180,22 @@
           assertIsCallable(v)
           // If importing functions from another WASM instance,
           // we can shortcut *and* we can do more typechecking.
+          // If they're not from WASM, we need to convert arguments
+          // and return types between the two worlds.
           if (! v._wasmRawFunc) {
-            imports.push(v)
+            var typ = sections[SECTIONS.TYPE][i.type]
+            imports.push(function() {
+              var args = []
+              var origArgs = arguments
+              typ.param_types.forEach(function(param_typ, idx) {
+                args.push(ToJSValue(origArgs[idx], param_typ))
+              })
+              var res = v.apply(undefined, args)
+              if (typ.return_types.length > 0) {
+                res = ToWebAssemblyValue(res, typ.return_types[0])
+              }
+              return res
+            })
           } else {
             if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(sections[SECTIONS.TYPE][i.type])) {
               throw new TypeError("function import type mis-match")
@@ -303,26 +317,45 @@
       buffer: new ArrayBuffer(initial * PAGE_SIZE),
       initial: initial,
       current: initial,
-      maximum: maximum
+      maximum: maximum,
+      callbacks: []
     }
   }
 
+  Memory.prototype._onChange = function _onChange(cb) {
+    // XXX TODO: can we use weakrefs for this, to avoid
+    // the Memory keeping all connected instances alive?
+    this._internals.callbacks.push(cb)
+  }
+
   Memory.prototype.grow = function grow(delta) {
+    var oldSize = this._grow(delta)
+    if (oldSize < 0) {
+      throw new RangeError()
+    }
+    return oldSize
+  }
+
+  Memory.prototype._grow = function grow(delta) {
     assertIsInstance(this, Memory)
     // XXX TODO: guard against overflow?
     var oldSize = this._internals.current
     var newSize = oldSize + ToNonWrappingUint32(delta)
     if (this._internals.maximum !== null) {
       if (newSize > this._internals.maximum) {
-        throw new RangeError()
+        return -1
       }
     }
     var newBuffer = new ArrayBuffer(newSize * PAGE_SIZE)
-    // XXX TODO efficient copy of the old buffer
-    notImplemented("copy from old buffer to new buffer")
+    // XXX TODO more efficient copy of the old buffer?
+    new Uint8Array(newBuffer).set(new Uint8Array(this._internals.buffer))
     // XXX TODO: cleanly detach the old buffer
     this._internals.buffer = newBuffer
     this._internals.current = newSize
+    // Notify listeners that things have changed.
+    this._internals.callbacks.forEach(function (cb){
+      cb()
+    })
     return oldSize
   }
 
@@ -2688,9 +2721,9 @@
 
             case OPCODES.GROW_MEMORY:
               read_varuint1()
-              popStackVar(TYPES.I32)
-              pushLine("trap('grow_memory not implemented yet')")
-              pushStackVar(TYPES.I32)
+              var operand = popStackVar(TYPES.I32)
+              var res = pushStackVar(TYPES.I32)
+              pushLine(res + " = M0._grow(" + operand + ")")
               break
 
             case OPCODES.I32_CONST:
@@ -3421,6 +3454,19 @@
       src.push("var HF32 = new Float32Array(M0.buffer)")
       src.push("var HF64 = new Float64Array(M0.buffer)")
       src.push("var HDV = new DataView(M0.buffer)")
+      src.push("var onMemoryChange = function() {")
+      src.push("  memorySize = M0.buffer.byteLength")
+      src.push("  HI8 = new Int8Array(M0.buffer)")
+      src.push("  HI16 = new Int16Array(M0.buffer)")
+      src.push("  HI32 = new Int32Array(M0.buffer)")
+      src.push("  HU8 = new Uint8Array(M0.buffer)")
+      src.push("  HU16 = new Uint16Array(M0.buffer)")
+      src.push("  HU32 = new Uint32Array(M0.buffer)")
+      src.push("  HF32 = new Float32Array(M0.buffer)")
+      src.push("  HF64 = new Float64Array(M0.buffer)")
+      src.push("  HDV = new DataView(M0.buffer)")
+      src.push("}")
+      src.push("M0._onChange(onMemoryChange)")
     }
 
     // XXX TODO: declare globals.
@@ -3792,11 +3838,11 @@
     }
   }
 
-  function ToWebAssemblyValue(jsValue, kind) {
+  function ToWebAssemblyValue(jsValue, typ) {
     if (typeof jsValue !== 'number' && ! (jsValue instanceof Number)) {
       throw new TypeError("cant pass non-number in to WASM")
     }
-    switch (kind) {
+    switch (typ) {
       case TYPES.I32:
         return jsValue|0
       case TYPES.I64:
@@ -3806,7 +3852,22 @@
       case TYPES.F64:
         return +jsValue
       default:
-        throw new TypeError("Unknown type: " + kind)
+        throw new TypeError("Unknown type: " + typ)
+    }
+  }
+
+  function ToJSValue(wasmValue, typ) {
+    switch (typ) {
+      case TYPES.I32:
+      case TYPES.F32:
+      case TYPES.F64:
+        return wasmValue
+      case TYPES.I64:
+        // XXX TODO: precise semantics here?
+        // I think we're supposed to return an error...
+        return wasmValue.toNumber()
+      default:
+        throw new TypeError("unknown WASM type: " + typ)
     }
   }
 
