@@ -37,7 +37,7 @@
       var arg = arguments[i]
       if (typeof arg === 'string') {
         process.stderr.write(arg)
-      } else if (typeof arg === 'number') {
+      } else if (typeof arg === 'number' || (typeof arg === 'object' && isNaN(arg))) {
         process.stderr.write(renderJSValue(arg))
       } else {
         process.stderr.write(JSON.stringify(arg))
@@ -1597,7 +1597,8 @@
         function f32_compareOp(what) {
           var rhs = popStackVar(TYPES.F32)
           var lhs = popStackVar(TYPES.F32)
-          pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")|0")
+          var res = pushStackVar(TYPES.I32)
+          pushLine(res + " = (" + lhs + " " + what + " " + rhs + ")|0")
         }
 
         function f32_unaryOp(what) {
@@ -3091,31 +3092,31 @@
             case OPCODES.F32_CONVERT_S_I32:
               var operand = popStackVar(TYPES.I32)
               var output = pushStackVar(TYPES.F32)
-              pushLine(output + " = Math.fround(" + operand + "|0)")
+              pushLine(output + " = ToF32(" + operand + "|0)")
               break
 
             case OPCODES.F32_CONVERT_U_I32:
               var operand = popStackVar(TYPES.I32)
               var output = pushStackVar(TYPES.F32)
-              pushLine(output + " = Math.fround(" + operand + ">>>0)")
+              pushLine(output + " = ToF32(" + operand + ">>>0)")
               break
 
             case OPCODES.F32_CONVERT_S_I64:
               var operand = popStackVar(TYPES.I64)
               var output = pushStackVar(TYPES.F32)
-              pushLine(output + " = Math.fround(" + operand + ".toNumber())")
+              pushLine(output + " = ToF32(" + operand + ".toNumber())")
               break
 
             case OPCODES.F32_CONVERT_U_I64:
               var operand = popStackVar(TYPES.I64)
               var output = pushStackVar(TYPES.F32)
-              pushLine(output + " = Math.fround(" + operand + ".toUnsigned().toNumber())")
+              pushLine(output + " = ToF32(" + operand + ".toUnsigned().toNumber())")
               break
 
             case OPCODES.F32_DEMOTE_F64:
               var operand = popStackVar(TYPES.F64)
               var output = pushStackVar(TYPES.F32)
-              pushLine(output + " = Math.fround(" + operand + ")")
+              pushLine(output + " = ToF32(" + operand + ")")
               break
 
             case OPCODES.F64_CONVERT_S_I32:
@@ -3217,7 +3218,7 @@
   }
 
   function renderSectionsToJS(sections) {
-    //dump("---- RENDERING CODE ----")
+    //dump("\n\n---- RENDERING CODE ----\n\n")
     var src = []
 
     // Import all the things from the stdlib.
@@ -3449,7 +3450,12 @@
   }
 
   // f32 operations
-  stdlib.ToF32 = Math.fround
+  stdlib.ToF32 = function (v) {
+    if (isNaN(v) && typeof v === 'object') {
+      return v
+    }
+    return Math.fround(v)
+  }
   stdlib.f32_min = Math.min
   stdlib.f32_max = Math.max
   stdlib.f32_sqrt = Math.sqrt
@@ -3465,7 +3471,12 @@
     if (isNaN(v)) {
       scratchData.setFloat32(0, v, true)
       scratchBytes[3] &= ~0x80
-      return scratchData.getFloat32(0, true)
+      var res = scratchData.getFloat32(0, true)
+      if (typeof v === 'object' && v._signalling) {
+        res = new Number(res)
+        res._signalling = true
+      }
+      return res
     }
     return Math.abs(v)
   }
@@ -3477,7 +3488,12 @@
       } else {
         scratchBytes[3] |= 0x80
       }
-      return scratchData.getFloat32(0, true)
+      var res = scratchData.getFloat32(0, true)
+      if (typeof v === 'object' && v._signalling) {
+        res = new Number(res)
+        res._signalling = true
+      }
+      return res
     }
     return -v
   }
@@ -3489,9 +3505,10 @@
     return (v > 0 || 1 / v > 0) ? 1 : -1
   }
   stdlib.f32_copysign = function (x, y) {
+    var sign = stdlib.f32_signof(y)
     if (isNaN(x)) {
       scratchData.setFloat32(0, x, true)
-      if (stdlib.f32_signof(y) === -1) {
+      if (sign === -1) {
         scratchBytes[3] |= 0x80
       } else {
         scratchBytes[3] &= ~0x80
@@ -3503,7 +3520,7 @@
       }
       return v
     }
-    return stdlib.f32_signof(y) * Math.abs(x)
+    return sign * Math.abs(x)
   }
   stdlib.f32_reinterpret_i32 = function(v) {
     scratchData.setInt32(0, v, true)
@@ -3569,16 +3586,17 @@
     return (v > 0 || 1 / v > 0) ? 1 : -1
   }
   stdlib.f64_copysign = function (x, y) {
+    var sign = stdlib.f64_signof(y)
     if (isNaN(x)) {
       scratchData.setFloat64(0, x, true)
-      if (stdlib.f64_signof(y) === -1) {
+      if (sign === -1) {
         scratchBytes[7] |= 0x80
       } else {
         scratchBytes[7] &= ~0x80
       }
       return scratchData.getFloat64(0, true)
     }
-    return stdlib.f32_signof(y) * Math.abs(x)
+    return sign * Math.abs(x)
   }
   stdlib.f64_reinterpret_i64 = function(v) {
     scratchData.setInt32(0, v.low, true)
