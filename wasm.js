@@ -182,9 +182,7 @@
           }
           break
         case EXTERNAL_KINDS.GLOBAL:
-          // XXX TODO: check if i is an immutable global, TypeError if not
-          assertIsType(v, "number")
-          imports.push(ToWebAssemblyValue(v))
+          imports.push(ToWebAssemblyValue(v), i.kind)
           break
         case EXTERNAL_KINDS.MEMORY:
           assertInstanceOf(v, Memory)
@@ -904,20 +902,50 @@
       return l
     }
 
-    function parseInitExpr() {
+    function parseInitExpr(typ) {
       var e = {}
       e.op = read_byte()
       switch (e.op) {
         case OPCODES.I32_CONST:
+          if (typ !== TYPES.I32) {
+            throw new CompileError("invalid init_expr type: " + typ)
+          }
           e.jsexpr = renderJSValue(read_varint32())
           break
+        case OPCODES.I64_CONST:
+          if (typ !== TYPES.I64) {
+            throw new CompileError("invalid init_expr type: " + typ)
+          }
+          e.jsexpr = renderJSValue(read_varint64())
+          break
+        case OPCODES.F32_CONST:
+          if (typ !== TYPES.F32) {
+            throw new CompileError("invalid init_expr type: " + typ)
+          }
+          e.jsexpr = renderJSValue(read_f32())
+          break
+        case OPCODES.F64_CONST:
+          if (typ !== TYPES.F64) {
+            throw new CompileError("invalid init_expr type: " + typ)
+          }
+          e.jsexpr = renderJSValue(read_f64())
+          break
         case OPCODES.GET_GLOBAL:
-          e.value = read_varint32()
           var index = read_varuint32()
-          e.jsexpr = "g" + index
+          var globals = getImportedGlobals()
+          if (index >= globals.length) {
+            throw new CompileError("init_expr refers to non-imported global: " + index)
+          }
+          if (globals[index].type.content_type !== typ) {
+            throw new CompileError("init_expr refers to global of incorrect type")
+          }
+          if (globals[index].type.mutability) {
+            throw new CompileError("init_expr refers to mutable global")
+          }
+          e.jsexpr = "G" + index
           break
         default:
-          throw new CompileError("Unsupported init expr opcode: " + e.op)
+          throw new CompileError("Unsupported init expr opcode: 0x" + e.op.toString(16))
       }
       if (read_byte() !== OPCODES.END) {
         throw new CompileError("Unsupported init expr code")
@@ -1039,6 +1067,9 @@
             break
           case EXTERNAL_KINDS.GLOBAL:
             i.type = parseGlobalType()
+            if (i.type.mutability) {
+              throw new CompileError("mutable globals cannot be imported")
+            }
             break
           default:
             throw new CompileError("unknown import kind:" + i.kind)
@@ -1095,7 +1126,7 @@
       function parseGlobalVariable() {
         var g = {}
         g.type = parseGlobalType()
-        g.init = parseInitExpr()
+        g.init = parseInitExpr(g.type.content_type)
         return g
       }
     }
@@ -1130,6 +1161,10 @@
           case EXTERNAL_KINDS.GLOBAL:
             if (e.index >= (sections[SECTIONS.GLOBAL]||[]).length) {
               throw new CompileError("export of non-existent global")
+            }
+            var g = sections[SECTIONS.GLOBAL][e.index]
+            if (g.type.mutability) {
+              throw new CompileError("mutable globals cannot be exported")
             }
             break
           case EXTERNAL_KINDS.TABLE:
@@ -1172,8 +1207,7 @@
         if (e.index >= (sections[SECTIONS.TABLE] || []).length) {
           throw new CompileError("Invalid table index: " + e.index)
         }
-        e.offset = parseInitExpr()
-        // XXX TODO: check that initExpr is i32
+        e.offset = parseInitExpr(TYPES.I32)
         var num_elems = read_varuint32()
         e.elems = []
         while (num_elems > 0) {
@@ -1193,6 +1227,17 @@
         }
       })
       return importedFuncs
+    }
+
+    function getImportedGlobals() {
+      var imports = sections[SECTIONS.IMPORT] || []
+      var importedGlobals = []
+      imports.forEach(function(i, index) {
+        if (i.kind === EXTERNAL_KINDS.GLOBAL) {
+          importedGlobals.push(i)
+        }
+      })
+      return importedGlobals
     }
 
     function getFunctionSignature(index) {
@@ -1564,6 +1609,28 @@
           if (! declaredVars[nm]) {
             c.header_lines.push("    var " + nm + " = " + initVal)
             declaredVars[nm] = true
+          }
+        }
+
+        function getGlobalType(index) {
+          var globals = sections[SECTIONS.GLOBAL] || []
+          if (index >= globals.length) {
+            throw new CompileError("no such global: " + index)
+          }
+          return globals[index].type.content_type
+        }
+
+        function getGlobalVar(index, typ) {
+          return "G" + index
+        }
+
+        function checkGlobalMutable(index) {
+          var globals = sections[SECTIONS.GLOBAL] || []
+          if (index >= globals.length) {
+            throw new CompileError("no such global: " + index)
+          }
+          if (! globals[index].type.mutability) {
+            throw new CompileError("global is immutable: " + index)
           }
         }
 
@@ -2165,6 +2232,7 @@
             case OPCODES.SET_GLOBAL:
               var index = read_varuint32()
               var typ = getGlobalType(index)
+              checkGlobalMutable(index)
               pushLine(getGlobalVar(index, typ) + " = " + popStackVar(typ))
               break
 
@@ -3218,8 +3286,7 @@
       if (d.index !== 0) {
         throw new CompileError("MVP requires data index be zero")
       }
-      d.offset = parseInitExpr()
-      // XXX TODO: assert that initializer yields an i32
+      d.offset = parseInitExpr(TYPES.I32)
       var size = read_varuint32()
       d.data = read_bytes(size)
       return d
@@ -3242,14 +3309,19 @@
 
     var imports = sections[SECTIONS.IMPORT] || []
     var countFuncs = 0
+    var countGlobals = 0
     imports.forEach(function(i, idx) {
       switch (i.kind) {
         case EXTERNAL_KINDS.FUNCTION:
           src.push("var F" + countFuncs + " = imports[" + idx + "]")
           countFuncs++
           break
+        case EXTERNAL_KINDS.GLOBAL:
+          src.push("var G" + countGlobals + " = imports[" + idx + "]")
+          countGlobals++
+          break
         default:
-          notImplemented()
+          throw new CompileError("cannot render import kind: " + i.kind)
       }
     })
 
@@ -3284,7 +3356,7 @@
 
     var globals = sections[SECTIONS.GLOBAL] || []
     globals.forEach(function(g, idx) {
-      src.push("var G" + idx + " = " + g.init.jsexpr)
+      src.push("var G" + (idx + countGlobals) + " = " + renderJSValue(g.init.jsexpr))
     })
 
     // Render the code for each function.
@@ -3649,13 +3721,13 @@
 
   function ToWebAssemblyValue(jsValue, kind) {
     switch (kind) {
-      case "i32":
+      case EXTERNAL_KINDS.I32:
         return jsValue|0
-      case "i64":
+      case EXTERNAL_KINDS.I64:
         throw new TypeError()
-      case "f32":
-        return +jsValue
-      case "f64":
+      case EXTERNAL_KINDS.F32:
+        return stdlib.ToF32(jsValue)
+      case EXTERNAL_KINDS.F64:
         return +jsValue
       default:
         throw new TypeError()
@@ -3702,6 +3774,11 @@
       }
       return ((v < 0 || 1 / v < 0) ? "-" : "") + Math.abs(v)
     }
+    // Special rendering required for Long instances.
+    if (v instanceof Long) {
+      return "new Long(" + v.low + "," + v.high + ")"
+    }
+    // Everything else just renders as a string.
     return v
   }
 
