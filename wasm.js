@@ -1215,6 +1215,10 @@
 
     function parseExportSection() {
       var numImportedFunctions = getImportedFunctions().length
+      var numImportedGlobals = getImportedGlobals().length
+      var numImportedTables = getImportedTables().length
+      var numImportedMemories = getImportedMemories().length
+
       var count = read_varuint32()
       var entries = []
       var seenFields = {}
@@ -1241,21 +1245,20 @@
             }
             break
           case EXTERNAL_KINDS.GLOBAL:
-            if (e.index >= (sections[SECTIONS.GLOBAL]||[]).length) {
+            if (e.index >= (sections[SECTIONS.GLOBAL]||[]).length + numImportedGlobals) {
               throw new CompileError("export of non-existent global")
             }
-            var g = sections[SECTIONS.GLOBAL][e.index]
-            if (g.type.mutability) {
+            if (getGlobalMutability(e.index)) {
               throw new CompileError("mutable globals cannot be exported")
             }
             break
           case EXTERNAL_KINDS.TABLE:
-            if (e.index >= (sections[SECTIONS.TABLE]||[]).length) {
+            if (e.index >= (sections[SECTIONS.TABLE]||[]).length + numImportedTables) {
               throw new CompileError("export of non-existent table")
             }
             break
           case EXTERNAL_KINDS.MEMORY:
-            if (e.index >= (sections[SECTIONS.MEMORY]||[]).length) {
+            if (e.index >= (sections[SECTIONS.MEMORY]||[]).length + numImportedMemories) {
               throw new CompileError("export of non-existent memory")
             }
             break
@@ -1350,6 +1353,15 @@
         throw new CompileError("no such global: " + index)
       }
       return globals[index].type.content_type
+    }
+
+    function getGlobalMutability(index) {
+      var globals = getImportedGlobals()
+      globals = globals.concat(sections[SECTIONS.GLOBAL] || [])
+      if (index >= globals.length) {
+        throw new CompileError("no such global: " + index)
+      }
+      return globals[index].type.mutability
     }
 
     function getTableType(index) {
