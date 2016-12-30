@@ -2052,7 +2052,7 @@
                   }
                 }
                 popControlFlow()
-                if (cf.sig !== TYPES.NONE) {
+                if (cf.sig !== TYPES.NONE && cf.endReached) {
                   pushLine("  " + pushStackVar(cf.sig) + " = " + output)
                 }
                 switch (cf.op) {
@@ -2060,7 +2060,7 @@
                     pushLine("} while(0)")
                     break
                   case OPCODES.LOOP:
-                    pushLine("  break")
+                    pushLine("  break " + cf.label)
                     pushLine("}")
                     break
                   case OPCODES.IF:
@@ -3485,6 +3485,7 @@
       Array.prototype.push.apply(src, f.code.footer_lines)
       src.push(f.name + "._wasmTypeSigStr = '" + f.sigStr + "'")
       src.push(f.name + "._wasmJSWrapper = null")
+      src.push("")
     })
 
     // Fill the table with defined elements, if any.
