@@ -1498,7 +1498,6 @@
       // not least because that doesn't support growable memory anyway.
 
       function parseFunctionCode(f) {
-        try {
         var c = {
           header_lines: [],
           body_lines: [],
@@ -3438,18 +3437,8 @@
               throw new CompileError("unsupported opcode: 0x" + op.toString(16))
           }
         }
-        pushLine("// compiled successfully")
 
         return c
-        }
-        finally {
-          //dump("---") 
-          //dump(f.name + ":")
-          //dump(c.header_lines.join("\n"))
-          //dump(c.body_lines.join("\n"))
-          //dump(c.footer_lines.join("\n"))
-          //dump("---")
-        }
       }
     }
 
@@ -3483,16 +3472,27 @@
     //dump("\n\n---- RENDERING CODE ----\n\n")
     var src = []
 
-    // Import all the things from the stdlib.
+    function pushLine(ln) {
+      ln.split("\n").forEach(function(ln) {
+        src.push("  " + ln)
+      })
+    }
 
-    src.push("const Long = WebAssembly._Long")
+    // Import all the things from the stdlib.
+    pushLine("\n//  WebAssembly stdlib and helper functions\n")
+
+    pushLine("const Long = WebAssembly._Long")
     Object.keys(stdlib).forEach(function(key) {
-      src.push("const " + key + " = stdlib." + key)
+      pushLine("const " + key + " = stdlib." + key)
     })
 
     // Pull in various imports.
 
     var imports = sections[SECTIONS.IMPORT] || []
+    if (imports.length > 0) {
+      pushLine("\n//  Imports\n")
+    }
+
     var countFuncs = 0
     var countGlobals = 0
     var countTables = 0
@@ -3500,19 +3500,19 @@
     imports.forEach(function(i, idx) {
       switch (i.kind) {
         case EXTERNAL_KINDS.FUNCTION:
-          src.push("var F" + countFuncs + " = imports[" + idx + "]")
+          pushLine("var F" + countFuncs + " = imports[" + idx + "]")
           countFuncs++
           break
         case EXTERNAL_KINDS.GLOBAL:
-          src.push("var G" + countGlobals + " = imports[" + idx + "]")
+          pushLine("var G" + countGlobals + " = imports[" + idx + "]")
           countGlobals++
           break
         case EXTERNAL_KINDS.TABLE:
-          src.push("var T" + countTables + " = imports[" + idx + "]")
+          pushLine("var T" + countTables + " = imports[" + idx + "]")
           countTables++
           break
         case EXTERNAL_KINDS.MEMORY:
-          src.push("var M" + countMemories + " = imports[" + idx + "]")
+          pushLine("var M" + countMemories + " = imports[" + idx + "]")
           countMemories++
           break
         default:
@@ -3523,96 +3523,123 @@
     // Create requested tables.
 
     var tables = sections[SECTIONS.TABLE] || []
+    if (tables.length > 0) {
+      pushLine("\n//  Local table definitions\n")
+    }
     tables.forEach(function(t, idx) {
-      src.push("var T" + (idx + countTables) + " = new WebAssembly.Table(" + JSON.stringify(t.limits) + ")")
+      pushLine("var T" + (idx + countTables) + " = new WebAssembly.Table(" + JSON.stringify(t.limits) + ")")
     })
 
     // Create requested memory, and provide views into it.
 
     var memories = sections[SECTIONS.MEMORY] || []
+    if (memories.length > 0) {
+      pushLine("\n//  Local memory definitions\n")
+    }
     memories.forEach(function(m, idx) {
-      src.push("var M" + idx + " = new WebAssembly.Memory(" + JSON.stringify(m.limits) + ")")
+      pushLine("var M" + idx + " = new WebAssembly.Memory(" + JSON.stringify(m.limits) + ")")
     })
 
     if (countMemories || memories.length > 0) {
-      src.push("var memorySize = M0.buffer.byteLength")
-      src.push("var HI8 = new Int8Array(M0.buffer)")
-      src.push("var HI16 = new Int16Array(M0.buffer)")
-      src.push("var HI32 = new Int32Array(M0.buffer)")
-      src.push("var HU8 = new Uint8Array(M0.buffer)")
-      src.push("var HU16 = new Uint16Array(M0.buffer)")
-      src.push("var HU32 = new Uint32Array(M0.buffer)")
-      src.push("var HF32 = new Float32Array(M0.buffer)")
-      src.push("var HF64 = new Float64Array(M0.buffer)")
-      src.push("var HDV = new DataView(M0.buffer)")
-      src.push("var onMemoryChange = function() {")
-      src.push("  memorySize = M0.buffer.byteLength")
-      src.push("  HI8 = new Int8Array(M0.buffer)")
-      src.push("  HI16 = new Int16Array(M0.buffer)")
-      src.push("  HI32 = new Int32Array(M0.buffer)")
-      src.push("  HU8 = new Uint8Array(M0.buffer)")
-      src.push("  HU16 = new Uint16Array(M0.buffer)")
-      src.push("  HU32 = new Uint32Array(M0.buffer)")
-      src.push("  HF32 = new Float32Array(M0.buffer)")
-      src.push("  HF64 = new Float64Array(M0.buffer)")
-      src.push("  HDV = new DataView(M0.buffer)")
-      src.push("}")
-      src.push("M0._onChange(onMemoryChange)")
+      pushLine("var memorySize = M0.buffer.byteLength")
+      pushLine("var HI8 = new Int8Array(M0.buffer)")
+      pushLine("var HI16 = new Int16Array(M0.buffer)")
+      pushLine("var HI32 = new Int32Array(M0.buffer)")
+      pushLine("var HU8 = new Uint8Array(M0.buffer)")
+      pushLine("var HU16 = new Uint16Array(M0.buffer)")
+      pushLine("var HU32 = new Uint32Array(M0.buffer)")
+      pushLine("var HF32 = new Float32Array(M0.buffer)")
+      pushLine("var HF64 = new Float64Array(M0.buffer)")
+      pushLine("var HDV = new DataView(M0.buffer)")
+      pushLine("var onMemoryChange = function() {")
+      pushLine("  memorySize = M0.buffer.byteLength")
+      pushLine("  HI8 = new Int8Array(M0.buffer)")
+      pushLine("  HI16 = new Int16Array(M0.buffer)")
+      pushLine("  HI32 = new Int32Array(M0.buffer)")
+      pushLine("  HU8 = new Uint8Array(M0.buffer)")
+      pushLine("  HU16 = new Uint16Array(M0.buffer)")
+      pushLine("  HU32 = new Uint32Array(M0.buffer)")
+      pushLine("  HF32 = new Float32Array(M0.buffer)")
+      pushLine("  HF64 = new Float64Array(M0.buffer)")
+      pushLine("  HDV = new DataView(M0.buffer)")
+      pushLine("}")
+      pushLine("M0._onChange(onMemoryChange)")
     }
 
-    // XXX TODO: declare globals.
+    // Declare globals
 
     var globals = sections[SECTIONS.GLOBAL] || []
+    if (globals.length > 0) {
+      pushLine("\n//  Define globals\n")
+    }
     globals.forEach(function(g, idx) {
-      src.push("var G" + (idx + countGlobals) + " = " + g.init.jsexpr)
+      pushLine("var G" + (idx + countGlobals) + " = " + g.init.jsexpr)
     })
 
     // Render the code for each function.
 
     var code = sections[SECTIONS.CODE] || []
+    if (code.length > 0) {
+      pushLine("\n//  Function definitions\n")
+    }
     code.forEach(function(f, idx) {
-      Array.prototype.push.apply(src, f.code.header_lines)
-      Array.prototype.push.apply(src, f.code.body_lines)
-      Array.prototype.push.apply(src, f.code.footer_lines)
-      src.push(f.name + "._wasmTypeSigStr = '" + f.sigStr + "'")
-      src.push(f.name + "._wasmJSWrapper = null")
-      src.push("")
+      f.code.header_lines.forEach(function(ln) {
+        pushLine(ln)
+      })
+      f.code.body_lines.forEach(function(ln) {
+        pushLine(ln)
+      })
+      f.code.footer_lines.forEach(function(ln) {
+        pushLine(ln)
+      })
+      pushLine(f.name + "._wasmTypeSigStr = '" + f.sigStr + "'")
+      pushLine(f.name + "._wasmJSWrapper = null")
+      pushLine("")
     })
 
     // Fill the table with defined elements, if any.
-    // XXX TODO: bounds checking etc
 
     var elements = sections[SECTIONS.ELEMENT] || []
+    if (elements.length > 0) {
+      pushLine("\n//  Table element initialization\n")
+    }
     elements.forEach(function(e, idx) {
-      src.push("if ((" + e.offset.jsexpr + " + " + e.elems.length + " - 1) >= T" + e.index + ".length) { throw new TypeError('table out of bounds') }")
+      pushLine("if ((" + e.offset.jsexpr + " + " + e.elems.length + " - 1) >= T" + e.index + ".length) { throw new TypeError('table out of bounds') }")
       for (var i = 0; i < e.elems.length; i++) {
-        src.push("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
+        pushLine("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
       }
     })
 
     // Fill the memory with data from the module.
-    // XXX TODO: bounds checking etc
 
     var datas = sections[SECTIONS.DATA] || []
+    if (datas.length > 0) {
+      pushLine("\n//  Memory data initialization\n")
+    }
     datas.forEach(function(d, idx) {
       if (d.data.length > 0 ) {
-        src.push("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('memory out of bounds') }")
+        pushLine("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('memory out of bounds') }")
         for (var i = 0; i < d.data.length; i++) {
-          src.push("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
+          pushLine("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
         }
       }
     })
 
-    // XXX TODO: run the `start` code if it exists.
+    // Run the `start` function if it exists.
+
     var start = sections[SECTIONS.START]
     if (start !== null) {
-      src.push("F" + start + "()")
+      pushLine("\n//  Run the start function\n")
+      pushLine("F" + start + "()")
     }
 
     // Return the exports as an object.
 
-    src.push("var exports = {}")
     var exports = sections[SECTIONS.EXPORT] || []
+    if (exports.length > 0) {
+      pushLine("\n//  Exports\n")
+    }
+    pushLine("var exports = {}")
     exports.forEach(function(e, idx) {
       var ref = "trap()"
       switch (e.kind) {
@@ -3629,9 +3656,9 @@
           ref = "T" + e.index
           break
       }
-      src.push("exports[" + renderJSValue(e.field, constants) + "] = " + ref)
+      pushLine("exports[" + renderJSValue(e.field, constants) + "] = " + ref)
     })
-    src.push("return exports")
+    pushLine("return exports")
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
@@ -4013,7 +4040,7 @@
     // Quote simple strings directly, but place more complex ones
     // as constants so that we don't have to try to escape them.
     if (typeof v === 'string') {
-      if (/^[A-Za-z0-9_ ]*$/.test(v)) {
+      if (/^[A-Za-z0-9_ $-]*$/.test(v)) {
         return "'" + v + "'"
       }
       constants.push(v)
