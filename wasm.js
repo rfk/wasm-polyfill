@@ -121,10 +121,11 @@
   function Module(bufferSource) {
     assertIsDefined(this)
     var bytes = new Uint8Array(arrayBufferFromBufferSource(bufferSource))
-    var sections = parseBinaryEncoding(bytes)
+    var parsed = parseBinaryEncoding(bytes)
     this._internals = {
-      sections: sections,
-      jsmodule: renderSectionsToJS(sections)
+      sections: parsed.sections,
+      constants: parsed.constants,
+      jsmodule: renderSectionsToJS(parsed.sections, parsed.constants)
     }
   }
 
@@ -241,7 +242,8 @@
       }
     })
     // Instantiate the compiled javascript module, which will give us all the exports.
-    this._exports = moduleObject._internals.jsmodule(imports, stdlib)
+    var constants = moduleObject._internals.constants
+    this._exports = moduleObject._internals.jsmodule(imports, constants, stdlib)
 
     this.exports = {}
     var self = this;
@@ -336,12 +338,12 @@
     return oldSize
   }
 
-  Memory.prototype._grow = function grow(delta) {
+  Memory.prototype._grow = function _grow(delta) {
     assertIsInstance(this, Memory)
     // XXX TODO: guard against overflow?
     var oldSize = this._internals.current
     var newSize = oldSize + ToNonWrappingUint32(delta)
-    if (this._internals.maximum !== null) {
+    if (this._internals.maximum) {
       if (newSize > this._internals.maximum) {
         return -1
       }
@@ -689,13 +691,19 @@
 
     var idx = 0;
 
-    // The top-level: return an array of the known sections.
+    // The top-level.  We return an object with:
+    //   * sections: array of known section types
+    //   * constants: array of pre-calculated constants
     // This uses a bunch of helper functions defined below.
 
     var sections = [null]
+    var constants = []
     parseFileHeader()
     parseKnownSections()
-    return sections
+    return {
+      sections: sections,
+      constants: constants
+    }
 
     // Basic helper functions for reading primitive values,
     // and doing some type-checking etc.  You can distinguish
@@ -985,25 +993,25 @@
           if (typ !== TYPES.I32) {
             throw new CompileError("invalid init_expr type: " + typ)
           }
-          e.jsexpr = renderJSValue(read_varint32())
+          e.jsexpr = renderJSValue(read_varint32(), constants)
           break
         case OPCODES.I64_CONST:
           if (typ !== TYPES.I64) {
             throw new CompileError("invalid init_expr type: " + typ)
           }
-          e.jsexpr = renderJSValue(read_varint64())
+          e.jsexpr = renderJSValue(read_varint64(), constants)
           break
         case OPCODES.F32_CONST:
           if (typ !== TYPES.F32) {
             throw new CompileError("invalid init_expr type: " + typ)
           }
-          e.jsexpr = renderJSValue(read_f32())
+          e.jsexpr = renderJSValue(read_f32(), constants)
           break
         case OPCODES.F64_CONST:
           if (typ !== TYPES.F64) {
             throw new CompileError("invalid init_expr type: " + typ)
           }
-          e.jsexpr = renderJSValue(read_f64())
+          e.jsexpr = renderJSValue(read_f64(), constants)
           break
         case OPCODES.GET_GLOBAL:
           var index = read_varuint32()
@@ -2798,21 +2806,21 @@
 
             case OPCODES.I32_CONST:
               var val = read_varint32()
-              pushLine(pushStackVar(TYPES.I32) + " = " + renderJSValue(val))
+              pushLine(pushStackVar(TYPES.I32) + " = " + renderJSValue(val, constants))
               break
 
             case OPCODES.I64_CONST:
-              var v = read_varint64()
-              pushLine(pushStackVar(TYPES.I64) + " = new Long(" + v.low + "," + v.high + ")")
+              var val = read_varint64()
+              pushLine(pushStackVar(TYPES.I64) + " = " + renderJSValue(val, constants))
               break
 
             case OPCODES.F32_CONST:
               var val = read_f32()
-              pushLine(pushStackVar(TYPES.F32) + " = " + renderJSValue(val))
+              pushLine(pushStackVar(TYPES.F32) + " = " + renderJSValue(val, constants))
               break
 
             case OPCODES.F64_CONST:
-              pushLine(pushStackVar(TYPES.F64) + " = " + renderJSValue(read_f64()))
+              pushLine(pushStackVar(TYPES.F64) + " = " + renderJSValue(read_f64(), constants))
               break
 
             case OPCODES.I32_EQZ:
@@ -3460,7 +3468,7 @@
 
   }
 
-  function renderSectionsToJS(sections) {
+  function renderSectionsToJS(sections, constants) {
     //dump("\n\n---- RENDERING CODE ----\n\n")
     var src = []
 
@@ -3545,7 +3553,7 @@
 
     var globals = sections[SECTIONS.GLOBAL] || []
     globals.forEach(function(g, idx) {
-      src.push("var G" + (idx + countGlobals) + " = " + renderJSValue(g.init.jsexpr))
+      src.push("var G" + (idx + countGlobals) + " = " + g.init.jsexpr)
     })
 
     // Render the code for each function.
@@ -3592,7 +3600,7 @@
 
     // Return the exports as an object.
 
-    src.push("return {")
+    src.push("var exports = {}")
     var exports = sections[SECTIONS.EXPORT] || []
     exports.forEach(function(e, idx) {
       var ref = "trap()"
@@ -3610,15 +3618,15 @@
           ref = "T" + e.index
           break
       }
-      src.push("  '" + e.field + "' :" + ref + (idx == exports.length - 1 ? "" : ","))
+      src.push("exports[" + renderJSValue(e.field, constants) + "] = " + ref)
     })
-    src.push("}")
+    src.push("return exports")
 
     // That's it!  Compile it as a function and return it.
     var code = src.join("\n")
     //dump(code)
     //dump("---")
-    return new Function("imports", "stdlib", code)
+    return new Function("imports", "constants", "stdlib", code)
   }
 
 
@@ -3975,22 +3983,33 @@
     return null
   }
 
-  function renderJSValue(v) {
+  function renderJSValue(v, constants) {
     // We need to preserve two things that don't round-trip through v.toString():
     //  * the distinction between -0 and 0
     //  * the precise bit-pattern of an NaN
     if (typeof v === "number" || (typeof v === "object" && v instanceof Number)) {
       if (isNaN(v)) {
+        // XXX TODO: re-work this to just pass it in as a constant
         scratchData.setFloat64(0, v, true)
         return "WebAssembly._fromNaNBytes([" + scratchBytes.join(",") + "]," + (!!v._signalling) + ")"
       }
-      return ((v < 0 || 1 / v < 0) ? "-" : "") + Math.abs(v)
+      return "" + (((v < 0 || 1 / v < 0) ? "-" : "") + Math.abs(v))
     }
     // Special rendering required for Long instances.
     if (v instanceof Long) {
       return "new Long(" + v.low + "," + v.high + ")"
     }
+    // Quote simple strings directly, but place more complex ones
+    // as constants so that we don't have to try to escape them.
+    if (typeof v === 'string') {
+      if (/^[A-Za-z0-9_ ]*$/.test(v)) {
+        return "'" + v + "'"
+      }
+      constants.push(v)
+      return "constants[" + (constants.length - 1) + "]"
+    }
     // Everything else just renders as a string.
+    throw new CompileError('rendering unknown type of value: ' + (typeof v) + " : " + v)
     return v
   }
 
