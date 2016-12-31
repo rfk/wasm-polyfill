@@ -2,7 +2,6 @@
 const fs = require('fs')
 const path = require('path')
 const cp = require('child_process')
-const babel = require('babel-core')
 
 var SPECDIR = path.resolve(__dirname, '..', 'spec', 'interpreter')
 var CODEFILE = path.resolve(__dirname, '..', 'wasm-polyfill.min.js')
