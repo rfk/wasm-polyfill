@@ -138,3 +138,7 @@ Things to do:
   * Enable soft-validation failures, for completeness.
 
   * Add rollup.js or similar to bundle for the web.
+
+  * Try offloading as much of the work as possible to a
+    background worker, along the lines described in
+    https://github.com/lukewagner/polyfill-prototype-1#how-it-currently-works

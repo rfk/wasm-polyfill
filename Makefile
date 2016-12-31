@@ -1,5 +1,5 @@
 
-wasm-polyfill.min.js: src/wasm.js node_modules/long/package.json
+wasm-polyfill.min.js: src/*.js node_modules/long/package.json
 	./node_modules/.bin/rollup -c
 
 spec/interpreter/README.md:

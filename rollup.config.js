@@ -5,9 +5,10 @@ import uglify from 'rollup-plugin-uglify'
 
 export default {
   moduleName: 'WebAssembly',
-  entry: 'src/wasm.js',
-  format: 'umd',
+  entry: 'src/index.js',
   dest: 'wasm-polyfill.min.js',
+  format: 'umd',
+  noConflict: true,
   plugins: [
     nodeResolve({
       module: true,
