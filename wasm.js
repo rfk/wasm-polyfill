@@ -1294,7 +1294,15 @@
     }
 
     function parseStartSection() {
-      return read_varuint32()
+      var func_index = read_varuint32()
+      var sig = getFunctionSignature(func_index)
+      if (sig.param_types.length > 0) {
+        throw new CompileError("start function must take no parameters")
+      }
+      if (sig.return_types.length > 0) {
+        throw new CompileError("start function must return no results")
+      }
+      return func_index
     }
 
     function parseElementSection() {
