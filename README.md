@@ -28,3 +28,7 @@ Things that are awkward/weird/slow:
      * Worse, preserving the signalling bit of a NaN
   * Bounds-checks on every memory access
   * Checking alignment of memory access at runtime
+
+Things to do:
+
+  * Enable soft-validation failures, for completeness.
