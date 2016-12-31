@@ -1,7 +1,6 @@
-(function(globalScope) {
 
   // XXX TODO: more generic polyfill for this
-  var Long = require("long")
+  import Long from "long"
 
   //
   // The exports, trying to match the builtin JS API as much as possible.
@@ -20,16 +19,6 @@
     _Long: Long,
     _fromNaNBytes: _fromNaNBytes,
     _dump: dump
-  }
-
-  if (typeof module !== "undefined") {
-    if (typeof module.exports !== "undefined") {
-      module.exports = WebAssembly;
-    }
-  }
-
-  if (globalScope && typeof globalScope.WebAssembly === "undefined")  {
-    globalScope.WebAssembly = WebAssembly
   }
 
   function dump() {
@@ -243,7 +232,7 @@
     })
     // Instantiate the compiled javascript module, which will give us all the exports.
     var constants = moduleObject._internals.constants
-    this._exports = moduleObject._internals.jsmodule(imports, constants, stdlib)
+    this._exports = moduleObject._internals.jsmodule(WebAssembly, imports, constants, stdlib)
 
     this.exports = {}
     var self = this;
@@ -728,7 +717,7 @@
 
     function read_bytes(count) {
       checkEndOfBytes(count)
-      output = []
+      var output = []
       while (count > 0) {
         output.push(String.fromCharCode(bytes[idx++]))
         count--
@@ -1708,6 +1697,7 @@
 
         function getLocalVar(index, typ, param) {
           typ = typ || getLocalType(index)
+          var nm
           switch (typ) {
             case TYPES.I32:
               nm =  "li" + index
@@ -3664,7 +3654,7 @@
     var code = src.join("\n")
     //dump(code)
     //dump("---")
-    return new Function("imports", "constants", "stdlib", code)
+    return new Function("WebAssembly", "imports", "constants", "stdlib", code)
   }
 
 
@@ -4089,6 +4079,4 @@
      return typeCodes.join("")
    }
 
-  return WebAssembly
-
-})(typeof window !== "undefined" ? window : typeof global !== "undefined" ? global : this);
+  export default WebAssembly

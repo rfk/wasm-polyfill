@@ -96,10 +96,10 @@ Some things to note:
   interesting to make more parts of the output more asm.js-like over time.
 
 * The WASM stack is simulated using local variables.  In the above we have
-  "slX" for a long on the stack in position X, and "siX" for an int at
-  position X.  This works but generates a lot of unnecessary variable
-  shuffling, and there are probably lots of opportunities to elide stack
-  variables.
+  `si0` for an int on the stack in position zero, `sl1` for a long at
+  position 1, and so-on.  This works but generates a lot of unnecessary
+  variable shuffling, and there are probably lots of opportunities to elide
+  stack variables.
 
 * We simulate 64-bit integers using a `Long` class, to simplify the code
   generation logic.
