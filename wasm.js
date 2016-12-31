@@ -348,6 +348,9 @@
         return -1
       }
     }
+    if (newSize > 65536) {
+      return -1
+    }
     var newBuffer = new ArrayBuffer(newSize * PAGE_SIZE)
     // XXX TODO more efficient copy of the old buffer?
     new Uint8Array(newBuffer).set(new Uint8Array(this._internals.buffer))
