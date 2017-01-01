@@ -47,7 +47,7 @@ stdlib.UINT32_MIN = 0x00000000>>>0
 stdlib.UINT32_MAX = 0xFFFFFFFF>>>0
 
 // Misc structural functions.
-stdlib.trap = function(msg) { throw new RuntimeError(msg) }
+stdlib.trap = function(msg) { var e = new RuntimeError(msg || "it's a trap!") ; throw e };
 
 // i32 operations that are not primitive operators
 stdlib.i32_mul = Math.imul

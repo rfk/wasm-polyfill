@@ -9,7 +9,7 @@ import { TYPES } from "./constants"
 import stdlib from "./stdlib"
 
 export function trap(msg) {
-  throw new RuntimeError(msg)
+  throw new RuntimeError(msg || "it's a trap!")
 }
 
 export function assertIsDefined(obj) {
@@ -38,6 +38,9 @@ export function assertIsCallable(obj) {
 }
 
 export function ToWASMValue(jsValue, typ) {
+  if (typeof jsValue === "undefined") {
+    return jsValue
+  }
   if (typeof jsValue !== 'number' && ! (jsValue instanceof Number)) {
     throw new TypeError("cant pass non-number in to WASM")
   }
@@ -148,6 +151,9 @@ export function makeSigStr(funcSig) {
 }
 
 export function dump() {
+  if (typeof process === "undefined" || ! process.stderr) {
+    return console.log.apply(console, arguments)
+  }
   for (var i = 0; i < arguments.length; i++) {
     var arg = arguments[i]
     if (typeof arg === 'string') {

@@ -101,6 +101,7 @@ import stdlib from "./stdlib"
 import { dump, renderJSValue } from "./utils"
 import { SECTIONS, TYPES, EXTERNAL_KINDS } from "./constants"
 
+
 export default function renderToJS(sections, constants) {
 
   //dump("\n\n---- RENDERING CODE ----\n\n")
@@ -111,7 +112,9 @@ export default function renderToJS(sections, constants) {
   var src = []
   function pushLine(ln) {
     ln.split("\n").forEach(function(ln) {
-      src.push("  " + ln)
+      // Trim whitespace, or we produce something too large
+      // to be converted to a single javascript string.
+      src.push(ln.trim() + "\n")
     })
   }
 
@@ -243,7 +246,7 @@ export default function renderToJS(sections, constants) {
   elements.forEach(function(e, idx) {
     pushLine("if ((" + e.offset.jsexpr + " + " + e.elems.length + " - 1) >= T" + e.index + ".length) { throw new TypeError('table out of bounds') }")
     for (var i = 0; i < e.elems.length; i++) {
-      pushLine("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
+      pushLine("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + ")] = F" + e.elems[i])
     }
   })
 
@@ -256,8 +259,17 @@ export default function renderToJS(sections, constants) {
   datas.forEach(function(d, idx) {
     if (d.data.length > 0 ) {
       pushLine("if ((" + d.offset.jsexpr + " + " + d.data.length + " - 1) >= M0.buffer.byteLength) { throw new TypeError('memory out of bounds') }")
-      for (var i = 0; i < d.data.length; i++) {
-	pushLine("HI8[(" + d.offset.jsexpr + ") + " + i + "] = " + d.data.charCodeAt(i))
+      // Set in chunks to reduce source string size.
+      var chunkStart = 0
+      var chunkEnd = Math.min(32, d.data.length)
+      while (chunkStart < d.data.length) {
+        var items = []
+        for (var i = chunkStart; i < chunkEnd; i++) {
+          items.push(d.data.charCodeAt(i))
+        }
+        pushLine("HI8.set([" + items.join(",") + "], (" + d.offset.jsexpr + ") + " + chunkStart + ")")
+        chunkStart = chunkEnd
+        chunkEnd = Math.min(chunkEnd + 32, d.data.length)
       }
     }
   })
@@ -298,7 +310,15 @@ export default function renderToJS(sections, constants) {
   pushLine("return exports")
 
   // That's it!  Compile it as a function and return it.
-  var code = src.join("\n")
+  // The code is probably too big to put into a string...
+  //pushLine("})")
+
+  var size = 0
+  src.forEach(function(ln) {
+    size += ln.length + 1
+  })
+  dump("script source size: ", size)
+  var code = src.join("")
   //dump(code)
   //dump("---")
   return new Function("WebAssembly", "imports", "constants", "stdlib", code)

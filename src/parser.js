@@ -215,7 +215,7 @@ export default function parseBinaryEncoding(bytes) {
       // them just enough to detect well-formedness.
       if (!id) {
         var name_len = s.read_varuint32()
-        s.read_bytes(name_len)
+        dump("custom section: ", s.read_bytes(name_len))
         s.skip_to(next_section_idx)
         continue
       }
@@ -740,7 +740,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function pushLine(ln, indent) {
-	//if (isDeadCode) { return }
+	if (isDeadCode()) { return }
 	var indent = cfStack.length + (indent || 0) + 1
 	while (indent > 0) {
 	  ln = "  " + ln
@@ -893,7 +893,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function declareVarName(typ, nm) {
-	var initVal = "trap()"
+	var initVal = "trap('invalid initial value')"
 	switch (typ) {
 	  case TYPES.I32:
 	    initVal = "0|0"
@@ -942,7 +942,7 @@ export default function parseBinaryEncoding(bytes) {
 	cast = cast || "|0"
 	var rhs = "(" + popStackVar(TYPES.I32) + cast + ")"
 	var lhs = "(" + popStackVar(TYPES.I32) + cast + ")"
-	pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")" + cast)
+	pushLine(pushStackVar(TYPES.I32) + " = (" + lhs + what + rhs + ")" + cast)
       }
 
       function i32_binaryFunc(what, cast) {
@@ -1017,7 +1017,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function boundsCheck(addr, offset, size) {
-	pushLine("if ((" + addr + ">>>0) + " + (offset + size) + " > memorySize) { return trap() }")
+	pushLine("if ((" + addr + ">>>0) + " + (offset + size) + " > memorySize) { return trap('OOB') }")
       }
 
       function i32_load_unaligned(addr, offset) {
@@ -1027,7 +1027,7 @@ export default function parseBinaryEncoding(bytes) {
 
       function i32_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
 	pushLine("  " + res + " = HDV.getInt32(" + addr + " + " + offset + ", true)")
 	pushLine("} else {")
 	pushLine("  " + res + " = HI32[(" + addr + " + " + offset + ")>>2]")
@@ -1056,7 +1056,7 @@ export default function parseBinaryEncoding(bytes) {
 
       function i32_load16_s_aligned(addr, offset, value) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
 	pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
 	pushLine("} else {")
 	pushLine("  " + res + " = HI16[(" + addr + " + " + offset + ")>>1]")
@@ -1065,7 +1065,7 @@ export default function parseBinaryEncoding(bytes) {
 
       function i32_load16_u_aligned(addr, offset, value) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
 	pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true) & 0x0000FFFF")
 	pushLine("} else {")
 	pushLine("  " + res + " = HU16[(" + addr + " + " + offset + ")>>1]")
@@ -1077,7 +1077,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function i32_store_aligned(addr, offset, value) {
-	pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
 	pushLine("  HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
 	pushLine("} else {")
 	pushLine("  HI32[(" + addr + " + " + offset + ")>>2] = " + value)
@@ -1104,7 +1104,7 @@ export default function parseBinaryEncoding(bytes) {
 
       function f32_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.F32)
-	pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
 	pushLine("  " + res + " = HDV.getFloat32(" + addr + " + " + offset + ", true)")
 	pushLine("} else {")
 	pushLine("  " + res + " = HF32[(" + addr + " + " + offset + ")>>2]")
@@ -1118,7 +1118,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function f32_store_aligned(addr, offset, value) {
-	pushLine("if ((" + addr + " + " + offset + ") & 0xFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
 	pushLine("  HDV.setFloat32(" + addr + " + " + offset + ", " + value + ", true)")
 	pushLine("} else {")
 	pushLine("  HF32[(" + addr + " + " + offset + ")>>2] = " + value)
@@ -1133,7 +1133,7 @@ export default function parseBinaryEncoding(bytes) {
 
       function f64_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.F64)
-	pushLine("if ((" + addr + " + " + offset + ") & 0x0FFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
 	pushLine("  " + res + " = HDV.getFloat64(" + addr + " + " + offset + ", true)")
 	pushLine("} else {")
 	pushLine("  " + res + " = HF64[(" + addr + " + " + offset + ")>>3]")
@@ -1145,7 +1145,7 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function f64_store_aligned(addr, offset, value) {
-	pushLine("if ((" + addr + " + " + offset + ") & 0x0FFF) {")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
 	pushLine("  HDV.setFloat64(" + addr + " + " + offset + ", " + value + ", true)")
 	pushLine("} else {")
 	pushLine("  HF64[(" + addr + " + " + offset + ")>>3] = " + value)
@@ -1201,7 +1201,7 @@ export default function parseBinaryEncoding(bytes) {
 	    var sig = parseBlockType()
 	    var cond = popStackVar(TYPES.I32)
 	    var cf = pushControlFlow(op, sig)
-	    pushLine("if (" + cond + ") { " + cf.label + ": do {", -1)
+	    pushLine(cf.label + ": do { if ( " + cond + ") {", -1)
 	    break
 
 	  case OPCODES.ELSE:
@@ -1215,8 +1215,8 @@ export default function parseBinaryEncoding(bytes) {
 	    if (! cf.isDead) {
 	      cf.endReached = true
 	    }
-	    pushLine("} while (0) } else { "+ cf.label + ": do{")
-	    pushControlFlow(cf.op, cf.sig, cf.endReached)
+	    pushLine("} else {")
+	    pushControlFlow(OPCODES.ELSE, cf.sig, cf.endReached)
 	    break
 
 	  case OPCODES.END:
@@ -1242,6 +1242,10 @@ export default function parseBinaryEncoding(bytes) {
 		// Make one.
 		pushStackVar(cf.sig)
 	      }
+              // An if without an else always reaches the end of the block.
+              if (cf.op === OPCODES.IF) {
+                cf.endReached = true
+              }
 	      if (cf.endReached) {
 		if (cf.sig !== TYPES.NONE) {
 		  var output = getStackVar(cf.sig)
@@ -1264,13 +1268,14 @@ export default function parseBinaryEncoding(bytes) {
 		  pushLine("}")
 		  break
 		case OPCODES.IF:
-		  pushLine("} while (0) }")
+		case OPCODES.ELSE:
+		  pushLine("} } while (0)")
 		  break
 		default:
 		  throw new CompileError("Popped an unexpected control op")
 	      }
 	      if (! cf.endReached) {
-		markDeadCode()
+                markDeadCode()
 	      }
 	    }
 	    break
@@ -1281,6 +1286,7 @@ export default function parseBinaryEncoding(bytes) {
 	    switch (cf.op) {
 	      case OPCODES.BLOCK:
 	      case OPCODES.IF:
+	      case OPCODES.ELSE:
 		cf.endReached = true
 		if (cf.sig !== TYPES.NONE) {
 		  var resultVar = popStackVar(cf.sig)
@@ -1315,6 +1321,7 @@ export default function parseBinaryEncoding(bytes) {
 	    switch (cf.op) {
 	      case OPCODES.BLOCK:
 	      case OPCODES.IF:
+	      case OPCODES.ELSE:
 		cf.endReached = true
 		pushLine("if (" + popStackVar(TYPES.I32) + ") {")
 		if (cf.sig !== TYPES.NONE) {
@@ -1381,6 +1388,7 @@ export default function parseBinaryEncoding(bytes) {
 	      switch (cf.op) {
 		case OPCODES.BLOCK:
 		case OPCODES.IF:
+		case OPCODES.ELSE:
 		  pushLine("    break " + cf.label)
 		  break
 		case OPCODES.LOOP:
@@ -1404,6 +1412,7 @@ export default function parseBinaryEncoding(bytes) {
 	    switch (default_cf.op) {
 	      case OPCODES.BLOCK:
 	      case OPCODES.IF:
+	      case OPCODES.ELSE:
 		pushLine("    break " + default_cf.label)
 		break
 	      case OPCODES.LOOP:
@@ -1467,11 +1476,11 @@ export default function parseBinaryEncoding(bytes) {
 	    // placeholders that trap?
 	    // For now we just do a bunch of explicit checks.
 	    pushLine("if (!T0[" + callIdx + "]) {")
-	    pushLine("  trap()")
+	    pushLine("  trap('table OOB')")
 	    pushLine("}")
 	    pushLine("if (T0[" + callIdx + "]._wasmTypeSigStr) {")
 	    pushLine("  if (T0[" + callIdx + "]._wasmTypeSigStr !== '" + makeSigStr(callSig) + "') {")
-	    pushLine("    trap()")
+	    pushLine("    trap('table sig')")
 	    pushLine("  }")
 	    pushLine("}")
 	    if (callSig.return_types.length === 0) {
@@ -2159,27 +2168,27 @@ export default function parseBinaryEncoding(bytes) {
 	  case OPCODES.I32_DIV_S:
 	    var rhs = getStackVar(TYPES.I32)
 	    var lhs = getStackVar(TYPES.I32, 1)
-	    pushLine("if (" + rhs + " === 0) { return trap() }")
-	    pushLine("if (" + lhs + " === INT32_MIN && " + rhs + " === -1) { return trap() }")
+	    pushLine("if (" + rhs + " === 0) { return trap('i32_div_s') }")
+	    pushLine("if (" + lhs + " === INT32_MIN && " + rhs + " === -1) { return trap('i32_div_s') }")
 	    i32_binaryOp("/")
 	    break
 
 	  case OPCODES.I32_DIV_U:
 	    var rhs = getStackVar(TYPES.I32)
 	    var lhs = getStackVar(TYPES.I32, 1)
-	    pushLine("if (" + rhs + " === 0) { return trap() }")
+	    pushLine("if (" + rhs + " === 0) { return trap('i32_div_u') }")
 	    i32_binaryOp("/", ">>>0")
 	    break
 
 	  case OPCODES.I32_REM_S:
 	    var rhs = getStackVar(TYPES.I32)
-	    pushLine("if (" + rhs + " === 0) { return trap() }")
+	    pushLine("if (" + rhs + " === 0) { return trap('i32_rem_s') }")
 	    i32_binaryOp("%")
 	    break
 
 	  case OPCODES.I32_REM_U:
 	    var rhs = getStackVar(TYPES.I32)
-	    pushLine("if (" + rhs + " === 0) { return trap() }")
+	    pushLine("if (" + rhs + " === 0) { return trap('i32_rem_u') }")
 	    i32_binaryOp("%", ">>>0")
 	    var res = getStackVar(TYPES.I32)
 	    pushLine(res + " = " + res + "|0")
@@ -2244,26 +2253,26 @@ export default function parseBinaryEncoding(bytes) {
 	  case OPCODES.I64_DIV_S:
 	    var rhs = getStackVar(TYPES.I64)
 	    var lhs = getStackVar(TYPES.I64, 1)
-	    pushLine("if (" + rhs + ".isZero()) { return trap() }")
-	    pushLine("if (" + lhs + ".eq(Long.MIN_VALUE) && " + rhs + ".eq(Long.NEG_ONE)) { return trap() }")
+	    pushLine("if (" + rhs + ".isZero()) { return trap('i64_div_s') }")
+	    pushLine("if (" + lhs + ".eq(Long.MIN_VALUE) && " + rhs + ".eq(Long.NEG_ONE)) { return trap('i64_div_s') }")
 	    i64_binaryFunc("i64_div_s")
 	    break
 
 	  case OPCODES.I64_DIV_U:
 	    var rhs = getStackVar(TYPES.I64)
-	    pushLine("if (" + rhs + ".isZero()) { return trap() }")
+	    pushLine("if (" + rhs + ".isZero()) { return trap('i64_div_u') }")
 	    i64_binaryFunc("i64_div_u")
 	    break
 
 	  case OPCODES.I64_REM_S:
 	    var rhs = getStackVar(TYPES.I64)
-	    pushLine("if (" + rhs + ".isZero()) { return trap() }")
+	    pushLine("if (" + rhs + ".isZero()) { return trap('i64_rem_s') }")
 	    i64_binaryFunc("i64_rem_s")
 	    break
 
 	  case OPCODES.I64_REM_U:
 	    var rhs = getStackVar(TYPES.I64)
-	    pushLine("if (" + rhs + ".isZero()) { return trap() }")
+	    pushLine("if (" + rhs + ".isZero()) { return trap('i64_rem_u') }")
 	    i64_binaryFunc("i64_rem_u")
 	    break
 
@@ -2420,8 +2429,8 @@ export default function parseBinaryEncoding(bytes) {
 	  case OPCODES.I32_TRUNC_S_F32:
 	    var operand = popStackVar(TYPES.F32)
 	    var output = pushStackVar(TYPES.I32)
-	    pushLine("if (" + operand + " > INT32_MAX) { return trap() }")
-	    pushLine("if (" + operand + " < INT32_MIN) { return trap() }")
+	    pushLine("if (" + operand + " > INT32_MAX) { return trap('i32_trunc_s') }")
+	    pushLine("if (" + operand + " < INT32_MIN) { return trap('i32_trunc_s') }")
 	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
 	    pushLine(output + " = (" + operand + ")|0")
 	    break
@@ -2429,27 +2438,27 @@ export default function parseBinaryEncoding(bytes) {
 	  case OPCODES.I32_TRUNC_S_F64:
 	    var operand = popStackVar(TYPES.F64)
 	    var output = pushStackVar(TYPES.I32)
-	    pushLine("if (" + operand + " > INT32_MAX) { return trap() }")
-	    pushLine("if (" + operand + " < INT32_MIN) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " > INT32_MAX) { return trap('i32_trunc_s') }")
+	    pushLine("if (" + operand + " < INT32_MIN) { return trap('i32_trunc_s') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc_s') }")
 	    pushLine(output + " = (" + operand + ")|0")
 	    break
 
 	  case OPCODES.I32_TRUNC_U_F32:
 	    var operand = popStackVar(TYPES.F32)
 	    var output = pushStackVar(TYPES.I32)
-	    pushLine("if (" + operand + " > UINT32_MAX) { return trap() }")
-	    pushLine("if (" + operand + " <= -1) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " > UINT32_MAX) { return trap('i32_trunc') }")
+	    pushLine("if (" + operand + " <= -1) { return trap('i32_trunc') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc') }")
 	    pushLine(output + " = ((" + operand + ")>>>0)|0")
 	    break
 
 	  case OPCODES.I32_TRUNC_U_F64:
 	    var operand = popStackVar(TYPES.F64)
 	    var output = pushStackVar(TYPES.I32)
-	    pushLine("if (" + operand + " > UINT32_MAX) { return trap() }")
-	    pushLine("if (" + operand + " <= -1) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " > UINT32_MAX) { return trap('i32_trunc') }")
+	    pushLine("if (" + operand + " <= -1) { return trap('i32_trunc') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc') }")
 	    pushLine(output + " = (" + operand + ")>>>0")
 	    break
 
@@ -2470,9 +2479,9 @@ export default function parseBinaryEncoding(bytes) {
 	    var output = pushStackVar(TYPES.I64)
 	    // XXX TODO: I actually don't understand floating-point much at all,
 	    //           right now am just hacking the tests into passing...
-	    pushLine("if (" + operand + " >= 9.22337203685e+18) { return trap() }")
-	    pushLine("if (" + operand + " <= -9.22337313636e+18) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " >= 9.22337203685e+18) { return trap('i64-trunc') }")
+	    pushLine("if (" + operand + " <= -9.22337313636e+18) { return trap('i64-trunc') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
 	    pushLine(output + " = Long.fromNumber(" + operand + ")")
 	    break
 
@@ -2481,9 +2490,9 @@ export default function parseBinaryEncoding(bytes) {
 	    var output = pushStackVar(TYPES.I64)
 	    // XXX TODO: I actually don't understand floating-point much at all,
 	    //           right now am just hacking the tests into passing...
-	    pushLine("if (" + operand + " >= 9223372036854775808.0) { return trap() }")
-	    pushLine("if (" + operand + " <= -9223372036854777856.0) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " >= 9223372036854775808.0) { return trap('i64-trunc') }")
+	    pushLine("if (" + operand + " <= -9223372036854777856.0) { return trap('i64-trunc') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
 	    pushLine(output + " = Long.fromNumber(" + operand + ")")
 	    break
 
@@ -2492,9 +2501,9 @@ export default function parseBinaryEncoding(bytes) {
 	    var output = pushStackVar(TYPES.I64)
 	    // XXX TODO: I actually don't understand floating-point much at all,
 	    //           right now am just hacking the tests into passing...
-	    pushLine("if (" + operand + " >= 1.84467440737e+19) { return trap() }")
-	    pushLine("if (" + operand + " <= -1) { return trap() }")
-	    pushLine("if (isNaN(" + operand + ")) { return trap() }")
+	    pushLine("if (" + operand + " >= 1.84467440737e+19) { return trap('i64-trunc') }")
+	    pushLine("if (" + operand + " <= -1) { return trap('i64-trunc') }")
+	    pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
 	    pushLine(output + " = Long.fromNumber(" + operand + ", true).toSigned()")
 	    break
 

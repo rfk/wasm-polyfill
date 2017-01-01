@@ -150,7 +150,7 @@ export default function Instance(moduleObject, importObject) {
               }
             }
             try {
-              return self._exports[e.field].apply(this, args)
+              return wasmFunc.apply(this, args)
             } catch (err) {
               // For test compatibilty, we want stack space exhaustion to trap.
               // XXX TODO: this can't really be necessary in practice, right?
