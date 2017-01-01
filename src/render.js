@@ -246,7 +246,7 @@ export default function renderToJS(sections, constants) {
   elements.forEach(function(e, idx) {
     pushLine("if ((" + e.offset.jsexpr + " + " + e.elems.length + " - 1) >= T" + e.index + ".length) { throw new TypeError('table out of bounds') }")
     for (var i = 0; i < e.elems.length; i++) {
-      pushLine("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + ")] = F" + e.elems[i])
+      pushLine("T" + e.index + "[(" + e.offset.jsexpr + ") + " + i + "] = F" + e.elems[i])
     }
   })
 
