@@ -1,3 +1,4 @@
 test.tmp.*
 node_modules/
 wasm-polyfill.min.js
+webextension/inject-wasm-polyfill.js
