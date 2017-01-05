@@ -4,10 +4,7 @@
 // This is a fairly straightforward procedural parser for the WASM
 // binary format.  It generates an object with the following properties:
 //
-//  {
-//    sections:   <array of known sections, indexes by section id>,
-//    constants:  <array of constants parsed out of the binary>
-//  }
+//   XXX TODO: complete this after refactoring
 //
 // You must provide the array of parsed constants when instantiating
 // an instance from the parsed module.
@@ -24,6 +21,7 @@
 
 import Long from "long"
 
+import stdlib from "./stdlib"
 import { CompileError } from "./errors"
 import { dump, renderJSValue, makeSigStr } from "./utils"
 import {
@@ -39,18 +37,16 @@ import {
 
 export default function parseBinaryEncoding(bytes) {
 
-  var s = new ParseStream(bytes) 
-
-  var sections = [null]
-  var constants = []
+  var s = new InputStream(bytes)
+  var r = new ParseResult()
 
   parseFileHeader()
+  renderJSHeader()
   parseKnownSections()
+  renderJSFooter()
 
-  return {
-    sections: sections,
-    constants: constants
-  }
+  r.finalize()
+  return r
 
   function parseValueType() {
     var v = s.read_varint7()
@@ -154,36 +150,35 @@ export default function parseBinaryEncoding(bytes) {
         if (typ !== TYPES.I32) {
           throw new CompileError("invalid init_expr type: " + typ)
         }
-        e.jsexpr = renderJSValue(s.read_varint32(), constants)
+        e.jsexpr = renderJSValue(s.read_varint32(), r.constants)
         break
       case OPCODES.I64_CONST:
         if (typ !== TYPES.I64) {
           throw new CompileError("invalid init_expr type: " + typ)
         }
-        e.jsexpr = renderJSValue(s.read_varint64(), constants)
+        e.jsexpr = renderJSValue(s.read_varint64(), r.constants)
         break
       case OPCODES.F32_CONST:
         if (typ !== TYPES.F32) {
           throw new CompileError("invalid init_expr type: " + typ)
         }
-        e.jsexpr = renderJSValue(s.read_float32(), constants)
+        e.jsexpr = renderJSValue(s.read_float32(), r.constants)
         break
       case OPCODES.F64_CONST:
         if (typ !== TYPES.F64) {
           throw new CompileError("invalid init_expr type: " + typ)
         }
-        e.jsexpr = renderJSValue(s.read_float64(), constants)
+        e.jsexpr = renderJSValue(s.read_float64(), r.constants)
         break
       case OPCODES.GET_GLOBAL:
         var index = s.read_varuint32()
-        var globals = getImportedGlobals()
-        if (index >= globals.length) {
+        if (index >= r.globals.length) {
           throw new CompileError("init_expr refers to non-imported global: " + index)
         }
-        if (globals[index].type.content_type !== typ) {
+        if (r.globals[index].type.content_type !== typ) {
           throw new CompileError("init_expr refers to global of incorrect type")
         }
-        if (globals[index].type.mutability) {
+        if (r.globals[index].type.mutability) {
           throw new CompileError("init_expr refers to mutable global")
         }
         e.jsexpr = "G" + index
@@ -206,6 +201,15 @@ export default function parseBinaryEncoding(bytes) {
     }
   }
 
+  function renderJSHeader() {
+    // Import all the things from the stdlib.
+    r.putln("(function(WebAssembly, imports, constants, stdlib) {")
+    r.putln("const Long = WebAssembly._Long")
+    Object.keys(stdlib).forEach(function(key) {
+      r.putln("const ", key, " = stdlib.", key)
+    })
+  }
+
   function parseKnownSections() {
     while (s.has_more_bytes()) {
       var id = s.read_varuint7()
@@ -213,26 +217,19 @@ export default function parseBinaryEncoding(bytes) {
       var next_section_idx = s.idx + payload_len
       // Ignoring named sections for now, but parsing
       // them just enough to detect well-formedness.
-      if (!id) {
+      if (! id) {
         var name_len = s.read_varuint32()
-        dump("custom section: ", s.read_bytes(name_len))
+        s.read_bytes(name_len)
         s.skip_to(next_section_idx)
         continue
       }
       // Known sections are not allowed to appear out-of-order.
-      if (id < sections.length) { throw new CompileError("out-of-order section: " + id.toString()) }
-      // But some sections may be missing.
-      while (sections.length < id) {
-        sections.push(null)
-      }
-      sections.push(parseSection(id))
+      if (id <= r.lastSection) { throw new CompileError("out-of-order section: " + id.toString()) }
+      parseSection(id)
+      r.lastSection = id
       // Check that we didn't ready past the declared end of section.
       // It's OK if there was some extra padding garbage in the payload data.
       s.skip_to(next_section_idx)
-    }
-    // Fill the rest of the known sections with nulls.
-    while (sections.length <= SECTIONS.DATA) {
-      sections.push(null)
     }
   }
 
@@ -267,25 +264,19 @@ export default function parseBinaryEncoding(bytes) {
 
   function parseTypeSection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      entries.push(parseFuncType())
+      r.types.push(parseFuncType())
       count--
     }
-    return entries
   }
-
-  var hasTable = false
-  var hasMemory = false
 
   function parseImportSection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      entries.push(parseImportEntry())
+      r.imports.push(parseImportEntry())
       count--
     }
-    return entries
+    r.numImportedFunctions = r.functions.length
 
     function parseImportEntry() {
       var i = {}
@@ -297,29 +288,36 @@ export default function parseBinaryEncoding(bytes) {
       switch (i.kind) {
 	case EXTERNAL_KINDS.FUNCTION:
 	  i.type = s.read_varuint32()
-	  if (i.type >= (sections[SECTIONS.TYPE] || []).length) {
+	  if (i.type >= r.types.length) {
 	    throw new CompileError("import has unknown type: " + i.type)
 	  }
+          r.putln("var F", r.functions.length, " = imports[", r.imports.length, "]")
+          r.functions.push(i)
 	  break
 	case EXTERNAL_KINDS.TABLE:
-	  if (hasTable) {
+	  if (r.tables.length > 0) {
 	    throw new CompileError("multiple tables")
 	  }
-	  hasTable = true
 	  i.type = parseTableType()
+          r.putln("var T", r.tables.length, " = imports[", r.imports.length, "]")
+          r.tables.push(i)
 	  break
 	case EXTERNAL_KINDS.MEMORY:
-	  if (hasMemory) {
+	  if (r.memories.length > 0) {
 	    throw new CompileError("multiple memories")
 	  }
-	  hasMemory = true
 	  i.type = parseMemoryType()
+          r.putln("var M", r.memories.length, " = imports[", r.imports.length, "]")
+          renderMemoryInitializer(i, r.memories.length)
+          r.memories.push(i)
 	  break
 	case EXTERNAL_KINDS.GLOBAL:
 	  i.type = parseGlobalType()
 	  if (i.type.mutability) {
 	    throw new CompileError("mutable globals cannot be imported")
 	  }
+          r.putln("var G", r.globals.length, " = imports[", r.imports.length, "]")
+          r.globals.push(i)
 	  break
 	default:
 	  throw new CompileError("unknown import kind:" + i.kind)
@@ -330,56 +328,82 @@ export default function parseBinaryEncoding(bytes) {
 
   function parseFunctionSection() {
     var count = s.read_varuint32()
-    var types = []
     while (count > 0) {
-      types.push(s.read_varuint32())
+      var f = { type: s.read_varuint32() }
+      if (f.type >= r.types.length) {
+        throw new CompileError("function has unknown type: " + f.type)
+      }
+      r.functions.push(f)
       count--
     }
-    return types
   }
 
   function parseTableSection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      if (hasTable) {
+      if (r.tables.length > 0) {
 	throw new CompileError("multiple tables")
       }
-      hasTable = true
-      entries.push(parseTableType())
+      var t = parseTableType()
+      r.putln("var T", r.tables.length, " = new WebAssembly.Table(", JSON.stringify(t.limits), ")")
+      r.tables.push(t)
       count--
     }
-    if (entries.length > 1) {
+    if (r.tables.length > 1) {
       throw new CompileError("more than one table entry")
     }
-    return entries
   }
 
   function parseMemorySection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      if (hasMemory) {
+      if (r.memories.length > 0) {
 	throw new CompileError("multiple memories")
       }
-      hasMemory = true
-      entries.push(parseMemoryType())
+      var m = parseMemoryType()
+      r.putln("var M", r.memories.length, " = new WebAssembly.Memory(", JSON.stringify(m.limits), ")")
+      renderMemoryInitializer(m, r.memories.length)
+      r.memories.push(m)
       count--
     }
-    if (entries.length > 1) {
+    if (r.memories.length > 1) {
       throw new CompileError("more than one memory entry")
     }
-    return entries
+  }
+
+  function renderMemoryInitializer(m, idx) {
+    r.putln("var memorySize = M", idx, ".buffer.byteLength")
+    r.putln("var HI8 = new Int8Array(M", idx, ".buffer)")
+    r.putln("var HI16 = new Int16Array(M", idx, ".buffer)")
+    r.putln("var HI32 = new Int32Array(M", idx, ".buffer)")
+    r.putln("var HU8 = new Uint8Array(M", idx, ".buffer)")
+    r.putln("var HU16 = new Uint16Array(M", idx, ".buffer)")
+    r.putln("var HU32 = new Uint32Array(M", idx, ".buffer)")
+    r.putln("var HF32 = new Float32Array(M", idx, ".buffer)")
+    r.putln("var HF64 = new Float64Array(M", idx, ".buffer)")
+    r.putln("var HDV = new DataView(M", idx, ".buffer)")
+    r.putln("M", idx, "._onChange(function() {")
+    r.putln("  memorySize = M", idx, ".buffer.byteLength")
+    r.putln("  HI8 = new Int8Array(M", idx, ".buffer)")
+    r.putln("  HI16 = new Int16Array(M", idx, ".buffer)")
+    r.putln("  HI32 = new Int32Array(M", idx, ".buffer)")
+    r.putln("  HU8 = new Uint8Array(M", idx, ".buffer)")
+    r.putln("  HU16 = new Uint16Array(M", idx, ".buffer)")
+    r.putln("  HU32 = new Uint32Array(M", idx, ".buffer)")
+    r.putln("  HF32 = new Float32Array(M", idx, ".buffer)")
+    r.putln("  HF64 = new Float64Array(M", idx, ".buffer)")
+    r.putln("  HDV = new DataView(M", idx, ".buffer)")
+    r.putln("});")
   }
 
   function parseGlobalSection() {
     var count = s.read_varuint32()
-    var globals = []
     while (count > 0) {
-      globals.push(parseGlobalVariable())
+      var g = parseGlobalVariable()
+      r.putln("var G", r.globals.length, " = ", g.init.jsexpr)
+      r.globals.push(g)
       count--
     }
-    return globals
 
     function parseGlobalVariable() {
       var g = {}
@@ -390,21 +414,18 @@ export default function parseBinaryEncoding(bytes) {
   }
 
   function parseExportSection() {
-    var numImportedFunctions = getImportedFunctions().length
-    var numImportedGlobals = getImportedGlobals().length
-    var numImportedTables = getImportedTables().length
-    var numImportedMemories = getImportedMemories().length
-
     var count = s.read_varuint32()
-    var entries = []
     var seenFields = {}
     while (count > 0) {
-      entries.push(parseExportEntry())
+      r.exports.push(parseExportEntry())
       count--
     }
-    return entries
 
     function parseExportEntry() {
+      // Note that we render these at the end.
+      // We *could* render them here are rely on function hoisting
+      // to bring the functions into scope, but the rendered code
+      // is more readable if the exports are at the end.
       var e = {}
       var field_len = s.read_varuint32()
       e.field = s.read_bytes(field_len)
@@ -416,12 +437,12 @@ export default function parseBinaryEncoding(bytes) {
       e.index = s.read_varuint32()
       switch (e.kind) {
 	case EXTERNAL_KINDS.FUNCTION:
-	  if (e.index >= (sections[SECTIONS.FUNCTION]||[]).length + numImportedFunctions) {
+	  if (e.index >= r.functions.length) {
 	    throw new CompileError("export of non-existent function")
 	  }
 	  break
 	case EXTERNAL_KINDS.GLOBAL:
-	  if (e.index >= (sections[SECTIONS.GLOBAL]||[]).length + numImportedGlobals) {
+	  if (e.index >= r.globals.length) {
 	    throw new CompileError("export of non-existent global")
 	  }
 	  if (getGlobalMutability(e.index)) {
@@ -429,24 +450,24 @@ export default function parseBinaryEncoding(bytes) {
 	  }
 	  break
 	case EXTERNAL_KINDS.TABLE:
-	  if (e.index >= (sections[SECTIONS.TABLE]||[]).length + numImportedTables) {
+	  if (e.index >= r.tables.length) {
 	    throw new CompileError("export of non-existent table")
 	  }
 	  break
 	case EXTERNAL_KINDS.MEMORY:
-	  if (e.index >= (sections[SECTIONS.MEMORY]||[]).length + numImportedMemories) {
+	  if (e.index >= r.memories.length) {
 	    throw new CompileError("export of non-existent memory")
 	  }
 	  break
 	default:
 	  throw new CompileError("unchecked export kind: " + e.kind)
       }
-      // XXX TODO: early check that index is within bounds for relevant index space?
       return e
     }
   }
 
   function parseStartSection() {
+    // Note that we don't render this until the end.
     var func_index = s.read_varuint32()
     var sig = getFunctionSignature(func_index)
     if (sig.param_types.length > 0) {
@@ -455,17 +476,25 @@ export default function parseBinaryEncoding(bytes) {
     if (sig.return_types.length > 0) {
       throw new CompileError("start function must return no results")
     }
-    return func_index
+    r.start = func_index
   }
 
   function parseElementSection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      entries.push(parseElementSegment())
+      var e = parseElementSegment()
+      // Rendering these here means we rely on function hoisting,
+      // but also that we don't need to keep the list of elements around.
+      r.putln("if ((", e.offset.jsexpr, " + ", e.elems.length, ") > T", e.index, ".length) {")
+      r.putln("  throw new TypeError('table out of bounds')")
+      r.putln("}")
+      for (var i = 0; i < e.elems.length; i++) {
+        r.putln("T", e.index, "[(", e.offset.jsexpr, ") + ", i, "] = F", e.elems[i])
+      }
+      delete e.elems
+      r.elements.push(e)
       count--
     }
-    return entries
 
     function parseElementSegment() {
       var e = {}
@@ -486,140 +515,65 @@ export default function parseBinaryEncoding(bytes) {
     }
   }
 
-  function getImportedFunctions() {
-    var imports = sections[SECTIONS.IMPORT] || []
-    var importedFuncs = []
-    imports.forEach(function(i, index) {
-      if (i.kind === EXTERNAL_KINDS.FUNCTION) {
-	importedFuncs.push(index)
-      }
-    })
-    return importedFuncs
-  }
-
-  function getImportedGlobals() {
-    var imports = sections[SECTIONS.IMPORT] || []
-    var importedGlobals = []
-    imports.forEach(function(i, index) {
-      if (i.kind === EXTERNAL_KINDS.GLOBAL) {
-	importedGlobals.push(i)
-      }
-    })
-    return importedGlobals
-  }
-
-  function getImportedTables() {
-    var imports = sections[SECTIONS.IMPORT] || []
-    var importedTables = []
-    imports.forEach(function(i, index) {
-      if (i.kind === EXTERNAL_KINDS.TABLE) {
-	importedTables.push(i.type)
-      }
-    })
-    return importedTables
-  }
-
-  function getImportedMemories() {
-    var imports = sections[SECTIONS.IMPORT] || []
-    var importedMemories = []
-    imports.forEach(function(i, index) {
-      if (i.kind === EXTERNAL_KINDS.MEMORY) {
-	importedMemories.push(i.type)
-      }
-    })
-    return importedMemories
-  }
-
   function getGlobalType(index) {
-    var globals = getImportedGlobals()
-    globals = globals.concat(sections[SECTIONS.GLOBAL] || [])
-    if (index >= globals.length) {
-      throw new CompileError("no such global: " + index)
+    if (index >= r.globals.length) {
+      throw new CompileError("getGlobalType: no such global: " + index)
     }
-    return globals[index].type.content_type
+    return r.globals[index].type.content_type
   }
 
   function getGlobalMutability(index) {
-    var globals = getImportedGlobals()
-    globals = globals.concat(sections[SECTIONS.GLOBAL] || [])
-    if (index >= globals.length) {
-      throw new CompileError("no such global: " + index)
+    if (index >= r.globals.length) {
+      throw new CompileError("getGlobalMut: no such global: " + index)
     }
-    return globals[index].type.mutability
+    return r.globals[index].type.mutability
   }
 
   function getTableType(index) {
-    var tables = getImportedTables()
-    tables = tables.concat(sections[SECTIONS.TABLE] || [])
-    if (index >= tables.length) {
+    if (index >= r.tables.length) {
       throw new CompileError("no such table: " + index)
     }
-    return tables[index]
+    return r.tables[index]
   }
 
   function getMemoryType(index) {
-    var memories = getImportedMemories()
-    memories = memories.concat(sections[SECTIONS.MEMORY] || [])
-    if (index >= memories.length) {
+    if (index >= r.memories.length) {
       throw new CompileError("no such memory: " + index)
     }
-    return memories[index]
+    return r.memories[index]
   }
 
   function getFunctionSignature(index) {
-    var count = 0
-    var imports = sections[SECTIONS.IMPORT] || []
-    for (var i = 0; i < imports.length; i++) {
-      if (imports[i].kind === EXTERNAL_KINDS.FUNCTION) {
-	if (index === count) {
-	  // It refers to an imported function.
-	  return getTypeSignature(imports[i].type)
-	}
-	count++
-      }
-    }
-    // It must refer to a locally-defined function.
-    index -= count
-    var functions = sections[SECTIONS.FUNCTION] || []
-    if (index >= functions.length) {
+    if (index >= r.functions.length) {
       throw new CompileError("Invalid function index: " + index)
     }
-    return getTypeSignature(functions[index])
+    return getTypeSignature(r.functions[index].type)
   }
 
   function getTypeSignature(index) {
-    var typeSection = sections[SECTIONS.TYPE] || []
-    if (index >= typeSection.length) {
+    if (index >= r.types.length) {
       throw new CompileError("Invalid type index: " + index)
     }
-    return typeSection[index]
+    return r.types[index]
   }
 
   function parseCodeSection() {
-    var numImportedFunctions = getImportedFunctions().length
     var count = s.read_varuint32()
-    if (sections[SECTIONS.FUNCTION] === null) {
-      throw new CompileError("code section without function section")
-    }
-    if (count !== sections[SECTIONS.FUNCTION].length) {
+    if (count + r.numImportedFunctions !== r.functions.length) {
       throw new CompileError("code section size different to function section size")
     }
-    var entries = []
+    
+    var n = r.numImportedFunctions
     while (count > 0) {
-      entries.push(parseFunctionBody(entries.length))
+      parseFunctionBody(n)
       count--
+      n++
     }
-    return entries
 
     function parseFunctionBody(index) {
       var f = {}
-      // XXX TODO: check that the function entry exists
-      f.name = "F" + (index + numImportedFunctions)
-      var sig_index = sections[SECTIONS.FUNCTION][index]
-      if (sig_index >= (sections[SECTIONS.TYPE] || []).length) {
-	throw new CompileError("unknown function type: " + sig_index)
-      }
-      f.sig = sections[SECTIONS.TYPE][sig_index]
+      f.name = "F" + index
+      f.sig = getFunctionSignature(index)
       f.sigStr = makeSigStr(f.sig)
       var body_size = s.read_varuint32()
       var end_of_body_idx = s.idx + body_size
@@ -629,7 +583,7 @@ export default function parseBinaryEncoding(bytes) {
 	f.locals.push(parseLocalEntry())
 	local_count--
       }
-      f.code = parseFunctionCode(f)
+      parseFunctionCode(f)
       s.skip_to(end_of_body_idx)
       return f
     }
@@ -648,16 +602,30 @@ export default function parseBinaryEncoding(bytes) {
     // not least because that doesn't support growable memory anyway.
 
     function parseFunctionCode(f) {
-      var c = {
-	header_lines: [],
-	body_lines: [],
-	footer_lines: []
-      }
+      var c = {}
+      var header_lines = []
+      var body_lines = []
 
       var declaredVars = {}
 
-      c.header_lines.push("function " + f.name + "(" + makeParamList() + ") {")
-      c.footer_lines.push("}")
+      header_lines.push("function " + f.name + "(" + makeParamList() + ") {")
+      f.sig.param_types.forEach(function(typ, idx) {
+        var nm = getLocalVar(idx, typ, true)
+        switch (typ) {
+          case TYPES.I32:
+            header_lines.push(nm + " = " + nm + "|0")
+            break
+          case TYPES.I64:
+            break
+          /* these break our NaN-boxing
+          case TYPES.F32:
+            header_lines.push(nm + " = ToF32(" + nm + ")")
+            break
+          case TYPES.F64:
+            header_lines.push(nm + " = +" + nm)
+            break*/
+        }
+      })
 
       function makeParamList() {
 	var params = []
@@ -740,13 +708,16 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function pushLine(ln, indent) {
-	if (isDeadCode()) { return }
+	if (isDeadCode()) {
+          body_lines.push("trap('dead code')")
+          return
+        }
 	var indent = cfStack.length + (indent || 0) + 1
 	while (indent > 0) {
 	  ln = "  " + ln
 	  indent--
 	}
-	c.body_lines.push(ln)
+	body_lines.push(ln)
       }
 
       function pushStackVar(typ) {
@@ -913,7 +884,7 @@ export default function parseBinaryEncoding(bytes) {
 	    throw new CompileError("unexpected type of variable")
 	}
 	if (! declaredVars[nm]) {
-	  c.header_lines.push("    var " + nm + " = " + initVal)
+	  header_lines.push("    var " + nm + " = " + initVal)
 	  declaredVars[nm] = true
 	}
       }
@@ -923,11 +894,10 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function checkGlobalMutable(index) {
-	var globals = sections[SECTIONS.GLOBAL] || []
-	if (index >= globals.length) {
-	  throw new CompileError("no such global: " + index)
+	if (index >= r.globals.length) {
+	  throw new CompileError("checkGlobalMut: no such global: " + index)
 	}
-	if (! globals[index].type.mutability) {
+	if (! r.globals[index].type.mutability) {
 	  throw new CompileError("global is immutable: " + index)
 	}
       }
@@ -1327,8 +1297,6 @@ export default function parseBinaryEncoding(bytes) {
 		if (cf.sig !== TYPES.NONE) {
 		  // This is left on the stack if condition is not true.
 		  // XXX TODO this needs to check what's on the stack.
-		  pushLine("// STACK " + JSON.stringify(cfStack))
-		  pushLine("// BLOCK TYPE " + cf.sig)
 		  var resultVar = getStackVar(cf.sig)
 		  var outputVar = getBlockOutputVar(cf)
 		  if (outputVar !== resultVar) {
@@ -1446,12 +1414,25 @@ export default function parseBinaryEncoding(bytes) {
 	    for (var i = callSig.param_types.length - 1; i >= 0; i--) {
 	      args[i] = popStackVar(callSig.param_types[i])
 	    }
+	    var call = "F" + index + "(" + args.join(",") + ")"
 	    if (callSig.return_types.length === 0) {
-	      pushLine("F" + index + "(" + args.join(",") + ")")
+	      pushLine(call)
 	    } else {
 	      // We know there's at most one return type, for now.
+              switch (callSig.return_types[0]) {
+                case TYPES.I32:
+                  call = call + "|0"
+                  break
+                /* These break our NaN boxing...
+                case TYPES.F32:
+                  call = "ToF32(" + call + ")"
+                  break
+                case TYPES.F64:
+                  call = "+" + call
+                  break*/
+              }
 	      var output = pushStackVar(callSig.return_types[0])
-	      pushLine(output + " = F" + index + "(" + args.join(",") + ")")
+	      pushLine(output + " = " + call)
 	    }
 	    break
 
@@ -1479,16 +1460,29 @@ export default function parseBinaryEncoding(bytes) {
 	    pushLine("  trap('table OOB')")
 	    pushLine("}")
 	    pushLine("if (T0[" + callIdx + "]._wasmTypeSigStr) {")
-	    pushLine("  if (T0[" + callIdx + "]._wasmTypeSigStr !== '" + makeSigStr(callSig) + "') {")
+	    pushLine("  if (T0[" + callIdx + "]._wasmTypeSigStr != '" + makeSigStr(callSig) + "') {")
 	    pushLine("    trap('table sig')")
 	    pushLine("  }")
 	    pushLine("}")
+	    var call = "T0[" + callIdx + "](" + args.join(",") + ")"
 	    if (callSig.return_types.length === 0) {
-	      pushLine("T0[" + callIdx + "](" + args.join(",") + ")")
+	      pushLine(call)
 	    } else {
 	      // We know there's at most one return type, for now.
+              switch (callSig.return_types[0]) {
+                case TYPES.I32:
+                  call = call + "|0"
+                  break
+                /* These break our NaN boxing...
+                case TYPES.F32:
+                  call = "ToF32(" + call + ")"
+                  break
+                case TYPES.F64:
+                  call = "+" + call
+                  break*/
+              }
 	      var output = pushStackVar(callSig.return_types[0])
-	      pushLine(output + " = T0[" + callIdx + "](" + args.join(",") + ")")
+	      pushLine(output + " = " + call)
 	    }
 	    break
 
@@ -1985,34 +1979,34 @@ export default function parseBinaryEncoding(bytes) {
 
 	  case OPCODES.I32_CONST:
 	    var val = s.read_varint32()
-	    pushLine(pushStackVar(TYPES.I32) + " = " + renderJSValue(val, constants))
+	    pushLine(pushStackVar(TYPES.I32) + " = " + renderJSValue(val, r.constants))
 	    break
 
 	  case OPCODES.I64_CONST:
 	    var val = s.read_varint64()
-	    pushLine(pushStackVar(TYPES.I64) + " = " + renderJSValue(val, constants))
+	    pushLine(pushStackVar(TYPES.I64) + " = " + renderJSValue(val, r.constants))
 	    break
 
 	  case OPCODES.F32_CONST:
 	    var val = s.read_float32()
-	    pushLine(pushStackVar(TYPES.F32) + " = " + renderJSValue(val, constants))
+	    pushLine(pushStackVar(TYPES.F32) + " = " + renderJSValue(val, r.constants))
 	    break
 
 	  case OPCODES.F64_CONST:
-	    pushLine(pushStackVar(TYPES.F64) + " = " + renderJSValue(s.read_float64(), constants))
+	    pushLine(pushStackVar(TYPES.F64) + " = " + renderJSValue(s.read_float64(), r.constants))
 	    break
 
 	  case OPCODES.I32_EQZ:
 	    var operand = getStackVar(TYPES.I32)
-	    pushLine(operand + " = (" + operand + " === 0)|0")
+	    pushLine(operand + " = (!(" + operand + "))|0")
 	    break
 
 	  case OPCODES.I32_EQ:
-	    i32_binaryOp("===")
+	    i32_binaryOp("==")
 	    break
 
 	  case OPCODES.I32_NE:
-	    i32_binaryOp("!==")
+	    i32_binaryOp("!=")
 	    break
 
 	  case OPCODES.I32_LT_S:
@@ -2094,11 +2088,11 @@ export default function parseBinaryEncoding(bytes) {
 	    break
 
 	  case OPCODES.F32_EQ:
-	    f32_compareOp("===")
+	    f32_compareOp("==")
 	    break
 
 	  case OPCODES.F32_NE:
-	    f32_compareOp("!==")
+	    f32_compareOp("!=")
 	    break
 
 	  case OPCODES.F32_LT:
@@ -2118,11 +2112,11 @@ export default function parseBinaryEncoding(bytes) {
 	    break
 
 	  case OPCODES.F64_EQ:
-	    f64_compareOp("===")
+	    f64_compareOp("==")
 	    break
 
 	  case OPCODES.F64_NE:
-	    f64_compareOp("!==")
+	    f64_compareOp("!=")
 	    break
 
 	  case OPCODES.F64_LT:
@@ -2168,27 +2162,27 @@ export default function parseBinaryEncoding(bytes) {
 	  case OPCODES.I32_DIV_S:
 	    var rhs = getStackVar(TYPES.I32)
 	    var lhs = getStackVar(TYPES.I32, 1)
-	    pushLine("if (" + rhs + " === 0) { return trap('i32_div_s') }")
-	    pushLine("if (" + lhs + " === INT32_MIN && " + rhs + " === -1) { return trap('i32_div_s') }")
+	    pushLine("if (" + rhs + " == 0) { return trap('i32_div_s') }")
+	    pushLine("if (" + lhs + " == INT32_MIN && " + rhs + " == -1) { return trap('i32_div_s') }")
 	    i32_binaryOp("/")
 	    break
 
 	  case OPCODES.I32_DIV_U:
 	    var rhs = getStackVar(TYPES.I32)
 	    var lhs = getStackVar(TYPES.I32, 1)
-	    pushLine("if (" + rhs + " === 0) { return trap('i32_div_u') }")
+	    pushLine("if (" + rhs + " == 0) { return trap('i32_div_u') }")
 	    i32_binaryOp("/", ">>>0")
 	    break
 
 	  case OPCODES.I32_REM_S:
 	    var rhs = getStackVar(TYPES.I32)
-	    pushLine("if (" + rhs + " === 0) { return trap('i32_rem_s') }")
+	    pushLine("if (" + rhs + " == 0) { return trap('i32_rem_s') }")
 	    i32_binaryOp("%")
 	    break
 
 	  case OPCODES.I32_REM_U:
 	    var rhs = getStackVar(TYPES.I32)
-	    pushLine("if (" + rhs + " === 0) { return trap('i32_rem_u') }")
+	    pushLine("if (" + rhs + " == 0) { return trap('i32_rem_u') }")
 	    i32_binaryOp("%", ">>>0")
 	    var res = getStackVar(TYPES.I32)
 	    pushLine(res + " = " + res + "|0")
@@ -2607,18 +2601,24 @@ export default function parseBinaryEncoding(bytes) {
 	}
       }
 
+      ([header_lines, body_lines]).forEach(function(lines) {
+        lines.forEach(function(ln) {
+          r.putln(ln)
+        })
+      })
+      r.putln("}")
+      r.putln(f.name, "._wasmTypeSigStr = '", f.sigStr, "'")
+      pushLine(f.name, "._wasmJSWrapper = null")
       return c
     }
   }
 
   function parseDataSection() {
     var count = s.read_varuint32()
-    var entries = []
     while (count > 0) {
-      entries.push(parseDataSegment())
+      r.datas.push(parseDataSegment())
       count--
     }
-    return entries
   }
 
   function parseDataSegment() {
@@ -2630,9 +2630,58 @@ export default function parseBinaryEncoding(bytes) {
     // Check that it's a valid memory reference.
     getMemoryType(d.index)
     d.offset = parseInitExpr(TYPES.I32)
-    var size = s.read_varuint32()
-    d.data = s.read_bytes(size)
+    var size = d.size = s.read_varuint32()
+    // Render the data initializer straight away, so that we don't
+    // have to hold the (potentially large) bytes object in memory.
+    if (size === 0) {
+      return d
+    }
+    r.putln("if ((", d.offset.jsexpr, " + ", size, ") > M0.buffer.byteLength) {")
+    r.putln("  throw new TypeError('memory out of bounds')")
+    r.putln("}")
+    var bytes = []
+    var pos = 0
+    while (size > 0) {
+      bytes.push(s.read_byte())
+      size--
+      if (bytes.length >= 1024 || size === 0) {
+        r.putln("HI8.set([", bytes.join(","), "], (", d.offset.jsexpr, ") + ", pos, ")")
+        pos += bytes.length
+        bytes = []
+      }
+    }
     return d
+  }
+
+  function renderJSFooter() {
+    // Run the `start` function if it exists.
+    if (r.start !== null) {
+      r.putln("F", r.start, "()")
+    }
+
+    // Return the exports as an object.
+    r.putln("var exports = {}")
+    r.exports.forEach(function(e, idx) {
+      var ref = "trap('invalid export')"
+      switch (e.kind) {
+	case EXTERNAL_KINDS.FUNCTION:
+	  ref = "F" + e.index
+	  break
+	case EXTERNAL_KINDS.GLOBAL:
+	  ref = "G" + e.index
+	  break
+	case EXTERNAL_KINDS.MEMORY:
+	  ref = "M" + e.index
+	  break
+	case EXTERNAL_KINDS.TABLE:
+	  ref = "T" + e.index
+	  break
+      }
+      r.putln("exports[", renderJSValue(e.field, r.constants), "] = " + ref)
+    })
+    r.putln("return exports")
+
+    r.putln("})")
   }
 
 }
@@ -2645,16 +2694,16 @@ export default function parseBinaryEncoding(bytes) {
 // it's just a nice abstraction.
 //
 
-function ParseStream(bytes) {
+function InputStream(bytes) {
   this.bytes = bytes
   this.idx = 0
 }
 
-ParseStream.prototype.has_more_bytes = function has_more_bytes() {
+InputStream.prototype.has_more_bytes = function has_more_bytes() {
   return (this.idx < this.bytes.length)
 }
 
-ParseStream.prototype.skip_to = function skip_to(idx) {
+InputStream.prototype.skip_to = function skip_to(idx) {
   if (this.idx > idx) {
     throw new CompileError("read past end of section")
   }
@@ -2664,15 +2713,18 @@ ParseStream.prototype.skip_to = function skip_to(idx) {
   this.idx = idx
 }
 
-ParseStream.prototype.read_byte = function read_byte() {
-  var b = this.bytes[this.idx++]
-  if (typeof b === 'undefined') {
+InputStream.prototype.read_byte = function read_byte() {
+  if (this.idx >= this.bytes.length) {
     throw new CompileError("unepected end of bytes")
   }
+  var b = this.bytes[this.idx++]|0
+  //if (typeof b === 'undefined') {
+  //  throw new CompileError("unepected end of bytes")
+  //}
   return b
 }
 
-ParseStream.prototype.read_bytes = function read_bytes(count) {
+InputStream.prototype.read_bytes = function read_bytes(count) {
   var output = []
   while (count > 0) {
     output.push(String.fromCharCode(this.read_byte()))
@@ -2681,23 +2733,23 @@ ParseStream.prototype.read_bytes = function read_bytes(count) {
   return output.join("")
 }
 
-ParseStream.prototype.read_uint8 = function read_uint8() {
+InputStream.prototype.read_uint8 = function read_uint8() {
   return this.read_byte()
 }
 
-ParseStream.prototype.read_uint16 = function read_uint16() {
+InputStream.prototype.read_uint16 = function read_uint16() {
   return (this.read_byte()) |
 	 (this.read_byte() << 8)
 }
 
-ParseStream.prototype.read_uint32 = function read_uint32() {
+InputStream.prototype.read_uint32 = function read_uint32() {
   return (this.read_byte()) |
 	 (this.read_byte() << 8) |
 	 (this.read_byte() << 16) |
 	 (this.read_byte() << 24)
 }
 
-ParseStream.prototype.read_varuint1 = function read_varuint1() {
+InputStream.prototype.read_varuint1 = function read_varuint1() {
   var v = this.read_varuint32()
   // 1-bit int, no bits other than the very last should be set.
   if (v & 0xFFFFFFFE) {
@@ -2706,7 +2758,7 @@ ParseStream.prototype.read_varuint1 = function read_varuint1() {
   return v
 }
 
-ParseStream.prototype.read_varuint7 = function read_varuint7() {
+InputStream.prototype.read_varuint7 = function read_varuint7() {
   var v = this.read_varuint32()
   // 7-bit int, none of the higher bits should be set.
   if (v & 0xFFFFFF80) {
@@ -2715,7 +2767,7 @@ ParseStream.prototype.read_varuint7 = function read_varuint7() {
   return v
 }
 
-ParseStream.prototype.read_varuint32 = function read_varuint32() {
+InputStream.prototype.read_varuint32 = function read_varuint32() {
   var b = 0
   var result = 0
   var shift = 0
@@ -2730,7 +2782,7 @@ ParseStream.prototype.read_varuint32 = function read_varuint32() {
   return result >>> 0
 }
 
-ParseStream.prototype.read_varint7 = function read_varint7() {
+InputStream.prototype.read_varint7 = function read_varint7() {
   var v = this.read_varint32()
   if (v > 63 || v < -64) {
     throw new CompileError("varint7 too large")
@@ -2738,7 +2790,7 @@ ParseStream.prototype.read_varint7 = function read_varint7() {
   return v
 }
 
-ParseStream.prototype.read_varint32 = function read_varint32() {
+InputStream.prototype.read_varint32 = function read_varint32() {
   var b = 0
   var result = 0
   var shift = 0
@@ -2756,7 +2808,7 @@ ParseStream.prototype.read_varint32 = function read_varint32() {
   return result
 }
 
-ParseStream.prototype.read_varint64 = function read_varint64() {
+InputStream.prototype.read_varint64 = function read_varint64() {
   // This is a little fiddly, we have to split the loop into
   // two halves so we can read the low and high parts into
   // two separate 32-bit integers.
@@ -2801,7 +2853,7 @@ ParseStream.prototype.read_varint64 = function read_varint64() {
   return new Long(low, high)
 }
 
-ParseStream.prototype.read_float32 = function read_float32() {
+InputStream.prototype.read_float32 = function read_float32() {
   var dv = new DataView(this.bytes.buffer)
   var v = dv.getFloat32(this.idx, true)
   // XXX TODO: is it possible to preserve the signalling bit of a NaN?
@@ -2820,9 +2872,61 @@ ParseStream.prototype.read_float32 = function read_float32() {
   return v
 }
 
-ParseStream.prototype.read_float64 = function read_float64() {
+InputStream.prototype.read_float64 = function read_float64() {
   var dv = new DataView(this.bytes.buffer)
   var v = dv.getFloat64(this.idx, true)
   this.idx += 8
   return v
+}
+
+
+//
+// A helper class for accumulating the output of a parse.
+//
+
+function ParseResult(bytes) {
+  this.buffer = new ArrayBuffer(32 * 1024)
+  this.bytes = new Uint8Array(this.buffer)
+  this.idx = 0
+  this.lastSection = 0
+  this.types = []
+  this.imports = []
+  this.exports = []
+  this.constants = []
+  this.functions = []
+  this.globals = []
+  this.tables = []
+  this.memories = []
+  this.elements = []
+  this.datas = []
+  this.start = null
+  this.numImportedFunctions = 0
+}
+
+ParseResult.prototype.putc = function putc(c) {
+  if (this.idx >= this.buffer.byteLength) {
+    var newSize = this.buffer.byteLength * 2
+    var newBuffer = new ArrayBuffer(newSize)
+    var newBytes = new Uint8Array(newBuffer)
+    newBytes.set(this.bytes)
+    this.buffer = newBuffer
+    this.bytes = newBytes
+  } 
+  this.bytes[this.idx++] = c
+}
+
+ParseResult.prototype.putstr = function putstr(s) {
+  //s = s.trim()
+  for (var i = 0; i < s.length; i++) {
+    this.putc(s.charCodeAt(i))
+  }
+}
+
+ParseResult.prototype.putln = function putln() {
+  this.putstr(Array.from(arguments).join(""))
+  this.putc('\n'.charCodeAt(0))
+}
+
+ParseResult.prototype.finalize = function finalize() {
+  this.bytes = this.bytes.subarray(0, this.idx)
 }

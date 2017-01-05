@@ -4,7 +4,7 @@
 //
 
 import Long from "long"
-import { CompileError } from "./errors"
+import { CompileError, RuntimeError } from "./errors"
 import { TYPES } from "./constants"
 import stdlib from "./stdlib"
 
@@ -39,7 +39,7 @@ export function assertIsCallable(obj) {
 
 export function ToWASMValue(jsValue, typ) {
   if (typeof jsValue === "undefined") {
-    return jsValue
+    return 0
   }
   if (typeof jsValue !== 'number' && ! (jsValue instanceof Number)) {
     throw new TypeError("cant pass non-number in to WASM")
@@ -143,7 +143,7 @@ export function makeSigStr(funcSig) {
    funcSig.param_types.forEach(function(typ) {
      typeCodes.push(typeCode(typ))
    })
-   typeCodes.push("->")
+   typeCodes.push("_")
    funcSig.return_types.forEach(function(typ) {
      typeCodes.push(typeCode(typ))
    })
@@ -166,4 +166,24 @@ export function dump() {
     process.stderr.write(' ')
   }
   process.stderr.write('\n')
+}
+
+var _filename = undefined;
+
+export function filename() {
+
+  if (_filename) {
+    return _filename
+  }
+
+  var errlines = new Error().stack.split('\n');
+  for (var i = 0; i < errlines.length; i++) {
+    var match = /(at .+ \(|at |@)(.+\/.+\.js):/.exec(errlines[i])
+    if (match) {
+      _filename = match[2]
+      return _filename
+    }
+  }
+
+  throw new RuntimeError("could not determine script filename")
 }

@@ -9,12 +9,10 @@
 
 
 fs = require('fs')
-var WebAssembly = require('./wasm-polyfill.min.js')
+var WebAssembly = require('../wasm-polyfill.min.js')
 
-buf = fs.readFileSync(process.argv[2])
-data = new Uint8Array(buf)
-m = new WebAssembly.Module(data)
+var buf = fs.readFileSync(process.argv[2])
+var data = new Uint8Array(buf)
+var r = WebAssembly._translate(data)
 
-// XXX TODO: Module should probably grow an interface for
-// this rather than just stringifying the function...
-process.stdout.write(m._internals.jsmodule.toString())
+process.stdout.write(new Buffer(r.bytes))

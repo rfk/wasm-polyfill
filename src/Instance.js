@@ -21,7 +21,8 @@ import {
   assertIsCallable,
   ToJSValue,
   ToWASMValue,
-  makeSigStr
+  makeSigStr,
+  dump
 } from "./utils"
 
   
@@ -36,9 +37,9 @@ export default function Instance(moduleObject, importObject) {
 
   // Collect, type-check and coerce the imports.
 
-  var sections = moduleObject._internals.sections
-  var imports = [];
-  (sections[SECTIONS.IMPORT] || []).forEach(function(i) {
+  var r = moduleObject._compiled
+  var imports = []
+  r.imports.forEach(function(i) {
     var o = importObject[i.module_name]
     assertIsInstance(o, Object)
     var v = o[i.item_name]
@@ -52,7 +53,7 @@ export default function Instance(moduleObject, importObject) {
           // If this is not a function from another WASM instance, then we
           // have to convert args and return values between WASM and JS semantics.
           // XXX TODO: we could probably make a more efficient translation layer...
-          var typ = sections[SECTIONS.TYPE][i.type]
+          var typ = r.types[i.type]
           imports.push(function() {
             var args = []
             var origArgs = arguments
@@ -65,10 +66,11 @@ export default function Instance(moduleObject, importObject) {
             }
             return res
           })
+          imports[imports.length-1]._origFunc = v
         } else {
           // If importing functions from another WASM instance,
           // we can shortcut *and* we can do more typechecking.
-          if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(sections[SECTIONS.TYPE][i.type])) {
+          if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(r.types[i.type])) {
             throw new TypeError("function import type mis-match")
           }
           imports.push(v._wasmRawFunc)
@@ -113,11 +115,10 @@ export default function Instance(moduleObject, importObject) {
   })
 
   // Instantiate the compiled javascript module, which will give us all the exports.
-  var constants = moduleObject._internals.constants
-  this._exports = moduleObject._internals.jsmodule(WebAssembly, imports, constants, stdlib)
+  this._exports = r.jsmodule(WebAssembly, imports, r.constants, stdlib)
   this.exports = {}
   var self = this;
-  (moduleObject._internals.sections[SECTIONS.EXPORT] || []).forEach(function(e) {
+  r.exports.forEach(function(e) {
     switch (e.kind) {
       case EXTERNAL_KINDS.FUNCTION:
         var wasmFunc = self._exports[e.field]
@@ -143,7 +144,7 @@ export default function Instance(moduleObject, importObject) {
                 case 'd':
                   args.push(+arguments[i])
                   break
-                case '-':
+                case '_':
                   break ARGLOOP
                 default:
                   throw new RuntimeError("malformed _wasmTypeSigStr")

@@ -11,6 +11,11 @@ spec/interpreter/wasm: spec/interpreter/README.md
 node_modules/long/package.json:
 	npm install
 
+webextension: ./webextension/wasm-polyfill.min.js
+
+./webextension/wasm-polyfill.min.js: wasm-polyfill.min.js
+	cp ./wasm-polyfill.min.js ./webextension/wasm-polyfill.min.js
+
 .PHONY: test
 test: wasm-polyfill.min.js spec/interpreter/wasm
 	 ./node_modules/.bin/mocha --timeout 10000 ./tests/

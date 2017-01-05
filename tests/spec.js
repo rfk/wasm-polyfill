@@ -52,8 +52,13 @@ function mkSpecTestRunner(filename) {
       fs.writeFileSync(testFile, testCode)
 
       // Run it with a subprocess, capturing output.
-      cp.exec('node ' + testFile, function(err, output) {
-        if (err) { return done(err) }
+      var output = ""
+      var proc = cp.spawn('node', [testFile], { stdio: [process.stdin, 'pipe', process.stderr] })
+      proc.stdout.on('data', function(chunk) {
+        output += chunk.toString()
+      })
+      proc.on('exit', function(code, signal) {
+        if (code || signal) { return done(code || signal) }
         var expectedOutput = null
         var expectedOutputFile = path.join(SPECDIR, 'test', 'expected-output', filename + '.log')
         if (fs.existsSync(expectedOutputFile)) {

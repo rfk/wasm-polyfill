@@ -18,6 +18,8 @@ import Module from "./Module"
 import Instance from "./Instance"
 import Table from "./Table"
 import Memory from "./Memory"
+import translate from "./translate"
+import { compileAsync, compileSync} from "./compile"
 import { CompileError, LinkError, RuntimeError } from "./errors"
 import { dump, _fromNaNBytes } from "./utils"
 
@@ -38,6 +40,7 @@ var WebAssembly = {
 
   // Some private things for our own convenience
   _Long: Long,
+  _translate: translate,
   _fromNaNBytes: _fromNaNBytes,
   _dump: dump
 }
@@ -45,7 +48,7 @@ var WebAssembly = {
 
 function validate(bytes) {
   try {
-    new Module(bytes)
+    compileSync(bytes)
   } catch (err) {
     if (err instanceof CompileError) {
       return false
@@ -56,15 +59,9 @@ function validate(bytes) {
 }
 
 function compile(bytes) {
-  // The parsing and compilation here is synchronous, but we return
-  // a promise for API consistency.  If we move it to being asynchronous
-  // then it's important that we (semantically) operate on a copy of
-  // the state of bytes at the time this function was called.
-  try {
-    return Promise.resolve(new Module(bytes))
-  } catch (err) {
-    return Promise.reject(err)
-  }
+  return compileAsync(bytes).then(function (r) {
+    return new Module(r)
+  })
 }
 
 function instantiate(bytesOrModuleObject, importObject) {

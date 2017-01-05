@@ -9,5 +9,8 @@
       "js": ["inject-wasm-polyfill.js"],
       "run_at": "document_start"
     }
+  ],
+  "web_accessible_resources": [
+    "wasm-polyfill.min.js"
   ]
 }
