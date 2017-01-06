@@ -33,7 +33,6 @@ export default stdlib
 
 var stdlib = {}
 
-
 // A little scratch space for examining the bits
 // of a float, converting float<->int, etc.
 var scratchBuf = new ArrayBuffer(8)
@@ -46,8 +45,9 @@ stdlib.INT32_MAX = 0x7FFFFFFF|0
 stdlib.UINT32_MIN = 0x00000000>>>0
 stdlib.UINT32_MAX = 0xFFFFFFFF>>>0
 
-// Misc structural functions.
+// Misc helpers functions.
 stdlib.trap = function(msg) { var e = new RuntimeError(msg || "it's a trap!") ; throw e };
+stdlib.Long = Long
 
 // i32 operations that are not primitive operators
 stdlib.i32_mul = Math.imul
@@ -215,22 +215,6 @@ stdlib.f32_reinterpret_i32 = function(v) {
     }
   }
   return v
-}
-stdlib.f32_load_fix_signalling = function(v, HU8, addr) {
-  if (isNaN(v)) {
-    if (!(HU8[addr + 2] & 0x40)) {
-      v = new Number(v)
-      v._signalling = true
-    }
-  }
-  return v
-}
-stdlib.f32_store_fix_signalling = function(v, HU8, addr) {
-  if (isNaN(v)) {
-    if (typeof v === 'object' && v._signalling) {
-      HU8[addr + 2] &= ~0x40
-    }
-  }
 }
 
 // f64 operations

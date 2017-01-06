@@ -60,7 +60,7 @@ Table.prototype.grow = function grow(delta) {
 Table.prototype.get = function get(index) {
   assertIsInstance(this, Table)
   index = ToNonWrappingUint32(index)
-  if (index >= this._internls.values.length) {
+  if (index >= this._internals.values.length) {
     throw RangeError
   }
   return this._internals.values[index]
@@ -73,4 +73,15 @@ Table.prototype.set = function set(index, value) {
     throw RangeError
   }
   this._internals.values[index] = value
+}
+
+Table.prototype._setmany = function _setmany(start, values) {
+  assertIsInstance(this, Table)
+  start = ToNonWrappingUint32(start)
+  if ((start + values.length) > this._internals.values.length) {
+    throw TypeError("table set out of bounds")
+  }
+  for (var i = 0; i < values.length; i++) {
+    this._internals.values[start + i] = values[i]
+  }
 }

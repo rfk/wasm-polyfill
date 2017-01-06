@@ -38,7 +38,9 @@ export default function Instance(moduleObject, importObject) {
   // Collect, type-check and coerce the imports.
 
   var r = moduleObject._compiled
-  var imports = []
+  var imports = {}
+  var numFuncsDone = 0
+  var numGlobalsDone = 0
   r.imports.forEach(function(i) {
     var o = importObject[i.module_name]
     assertIsInstance(o, Object)
@@ -54,7 +56,7 @@ export default function Instance(moduleObject, importObject) {
           // have to convert args and return values between WASM and JS semantics.
           // XXX TODO: we could probably make a more efficient translation layer...
           var typ = r.types[i.type]
-          imports.push(function() {
+          imports["F" + numFuncsDone] = function() {
             var args = []
             var origArgs = arguments
             typ.param_types.forEach(function(param_typ, idx) {
@@ -65,19 +67,21 @@ export default function Instance(moduleObject, importObject) {
               res = ToWASMValue(res, typ.return_types[0])
             }
             return res
-          })
-          imports[imports.length-1]._origFunc = v
+          }
+          imports["F" + numFuncsDone]._origFunc = v
         } else {
           // If importing functions from another WASM instance,
           // we can shortcut *and* we can do more typechecking.
           if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(r.types[i.type])) {
             throw new TypeError("function import type mis-match")
           }
-          imports.push(v._wasmRawFunc)
+          imports["F" + numFuncsDone] = v._wasmRawFunc
         }
+        numFuncsDone++
         break
       case EXTERNAL_KINDS.GLOBAL:
-        imports.push(ToWASMValue(v, i.type.content_type))
+        imports["G" + numGlobalsDone] = ToWASMValue(v, i.type.content_type)
+        numGlobalsDone++
         break
       case EXTERNAL_KINDS.MEMORY:
         assertIsInstance(v, Memory)
@@ -92,7 +96,7 @@ export default function Instance(moduleObject, importObject) {
             throw new TypeError("memory import has too large a maximum")
           }
         }
-        imports.push(v)
+        imports["M0"] = v
         break
       case EXTERNAL_KINDS.TABLE:
         assertIsInstance(v, Table)
@@ -107,15 +111,30 @@ export default function Instance(moduleObject, importObject) {
             throw new TypeError("table import has too large a maximum")
           }
         }
-        imports.push(v)
+        imports["T0"] = v
         break
       default:
         throw new RuntimeError("unexpected import kind: " + i.kind)
     }
   })
 
+  Object.keys(stdlib).forEach(function(key) {
+    imports[key] = stdlib[key]
+  })
+
   // Instantiate the compiled javascript module, which will give us all the exports.
-  this._exports = r.jsmodule(WebAssembly, imports, r.constants, stdlib)
+  var asmlib = {
+    Int8Array: Int8Array,
+    Int16Array: Int16Array,
+    Int32Array: Int32Array,
+    Uint8Array: Uint8Array,
+    Uint16Array: Uint16Array,
+    Uint32Array: Uint32Array,
+    Float32Array: Float32Array,
+    Float64Array: Float64Array,
+    Math: Math
+  }
+  this._exports = r.jsmodule(WebAssembly, r.constants, asmlib, imports)
   this.exports = {}
   var self = this;
   r.exports.forEach(function(e) {

@@ -19,3 +19,7 @@ webextension: ./webextension/wasm-polyfill.min.js
 .PHONY: test
 test: wasm-polyfill.min.js spec/interpreter/wasm
 	 ./node_modules/.bin/mocha --timeout 10000 ./tests/
+
+.PHONY: test-bail
+test-bail: wasm-polyfill.min.js spec/interpreter/wasm
+	 ./node_modules/.bin/mocha --timeout 10000 --bail ./tests/

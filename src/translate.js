@@ -6,6 +6,40 @@
 //
 //   XXX TODO: complete this after refactoring
 //
+//  function (WebAssembly, imports) {
+//
+//    var asmlib = {
+//      <things for asmjs stdlib
+//    }
+//    var asmimps = {
+//      I0: <named imports for asmjs>
+//      I1: <...>
+//      ...
+//      C0: <named constants for
+//    }
+//
+//    var M0 = new WebAssembly.Memory(...)
+//    var T0 = new WebAssembly.Table(...)
+//
+//    var funcs = asmfuncs(asmlib, asmimpos, M0.buffer)
+//
+//    var exports = {}
+//    exports['name'] = funcs.name
+//    exports['memory'] = M0
+//
+//    function asmfuncs(stdlib, foreign, heap) {
+//      "waswasm"
+//      
+//    }
+//
+//    M0.set([...])
+//
+//    start()
+//
+//    return exports
+//
+//  }
+//
 // You must provide the array of parsed constants when instantiating
 // an instance from the parsed module.
 //
@@ -202,12 +236,8 @@ export default function parseBinaryEncoding(bytes) {
   }
 
   function renderJSHeader() {
-    // Import all the things from the stdlib.
-    r.putln("(function(WebAssembly, imports, constants, stdlib) {")
+    r.putln("(function(WebAssembly, constants, asmlib, imports) {")
     r.putln("const Long = WebAssembly._Long")
-    Object.keys(stdlib).forEach(function(key) {
-      r.putln("const ", key, " = stdlib.", key)
-    })
   }
 
   function parseKnownSections() {
@@ -276,7 +306,6 @@ export default function parseBinaryEncoding(bytes) {
       r.imports.push(parseImportEntry())
       count--
     }
-    r.numImportedFunctions = r.functions.length
 
     function parseImportEntry() {
       var i = {}
@@ -286,38 +315,47 @@ export default function parseBinaryEncoding(bytes) {
       i.item_name = s.read_bytes(field_len)
       i.kind = parseExternalKind()
       switch (i.kind) {
+        // Imported functions get rendered in the asmjs sub-function.
 	case EXTERNAL_KINDS.FUNCTION:
 	  i.type = s.read_varuint32()
 	  if (i.type >= r.types.length) {
 	    throw new CompileError("import has unknown type: " + i.type)
 	  }
-          r.putln("var F", r.functions.length, " = imports[", r.imports.length, "]")
+          i.index = r.numImportedFunctions++
+          i.name = "F" + i.index
           r.functions.push(i)
 	  break
+        // Imported globals get rendered twice, so they're visible in both scopes
+        // while staying within the rules of asmjs.
+	case EXTERNAL_KINDS.GLOBAL:
+	  i.type = parseGlobalType()
+	  if (i.type.mutability) {
+	    throw new CompileError("mutable globals cannot be imported")
+	  }
+          i.index = r.numImportedGlobals++
+          // Exported immutable global, just repeat its declaration
+          // here and in the asmjs sub-function.
+          r.putln("var G", i.index, " = imports.G", i.index)
+          r.globals.push(i)
+	  break
+        // Imported tables and memories get rendered in the top-level function.
 	case EXTERNAL_KINDS.TABLE:
 	  if (r.tables.length > 0) {
 	    throw new CompileError("multiple tables")
 	  }
 	  i.type = parseTableType()
-          r.putln("var T", r.tables.length, " = imports[", r.imports.length, "]")
-          r.tables.push(i)
+          r.putln("var T", r.tables.length, " = imports.T", r.tables.length)
+          i.index = r.numImportedTables++
+          r.tables.push(i.type)
 	  break
 	case EXTERNAL_KINDS.MEMORY:
 	  if (r.memories.length > 0) {
 	    throw new CompileError("multiple memories")
 	  }
 	  i.type = parseMemoryType()
-          r.putln("var M", r.memories.length, " = imports[", r.imports.length, "]")
-          renderMemoryInitializer(i, r.memories.length)
-          r.memories.push(i)
-	  break
-	case EXTERNAL_KINDS.GLOBAL:
-	  i.type = parseGlobalType()
-	  if (i.type.mutability) {
-	    throw new CompileError("mutable globals cannot be imported")
-	  }
-          r.putln("var G", r.globals.length, " = imports[", r.imports.length, "]")
-          r.globals.push(i)
+          r.putln("var M", r.memories.length, " = imports.M", r.memories.length)
+          i.index = r.numImportedMemories++
+          r.memories.push(i.type)
 	  break
 	default:
 	  throw new CompileError("unknown import kind:" + i.kind)
@@ -333,6 +371,8 @@ export default function parseBinaryEncoding(bytes) {
       if (f.type >= r.types.length) {
         throw new CompileError("function has unknown type: " + f.type)
       }
+      f.index = r.functions.length
+      f.name = "F" + f.index
       r.functions.push(f)
       count--
     }
@@ -362,7 +402,6 @@ export default function parseBinaryEncoding(bytes) {
       }
       var m = parseMemoryType()
       r.putln("var M", r.memories.length, " = new WebAssembly.Memory(", JSON.stringify(m.limits), ")")
-      renderMemoryInitializer(m, r.memories.length)
       r.memories.push(m)
       count--
     }
@@ -371,36 +410,10 @@ export default function parseBinaryEncoding(bytes) {
     }
   }
 
-  function renderMemoryInitializer(m, idx) {
-    r.putln("var memorySize = M", idx, ".buffer.byteLength")
-    r.putln("var HI8 = new Int8Array(M", idx, ".buffer)")
-    r.putln("var HI16 = new Int16Array(M", idx, ".buffer)")
-    r.putln("var HI32 = new Int32Array(M", idx, ".buffer)")
-    r.putln("var HU8 = new Uint8Array(M", idx, ".buffer)")
-    r.putln("var HU16 = new Uint16Array(M", idx, ".buffer)")
-    r.putln("var HU32 = new Uint32Array(M", idx, ".buffer)")
-    r.putln("var HF32 = new Float32Array(M", idx, ".buffer)")
-    r.putln("var HF64 = new Float64Array(M", idx, ".buffer)")
-    r.putln("var HDV = new DataView(M", idx, ".buffer)")
-    r.putln("M", idx, "._onChange(function() {")
-    r.putln("  memorySize = M", idx, ".buffer.byteLength")
-    r.putln("  HI8 = new Int8Array(M", idx, ".buffer)")
-    r.putln("  HI16 = new Int16Array(M", idx, ".buffer)")
-    r.putln("  HI32 = new Int32Array(M", idx, ".buffer)")
-    r.putln("  HU8 = new Uint8Array(M", idx, ".buffer)")
-    r.putln("  HU16 = new Uint16Array(M", idx, ".buffer)")
-    r.putln("  HU32 = new Uint32Array(M", idx, ".buffer)")
-    r.putln("  HF32 = new Float32Array(M", idx, ".buffer)")
-    r.putln("  HF64 = new Float64Array(M", idx, ".buffer)")
-    r.putln("  HDV = new DataView(M", idx, ".buffer)")
-    r.putln("});")
-  }
-
   function parseGlobalSection() {
     var count = s.read_varuint32()
     while (count > 0) {
       var g = parseGlobalVariable()
-      r.putln("var G", r.globals.length, " = ", g.init.jsexpr)
       r.globals.push(g)
       count--
     }
@@ -413,7 +426,260 @@ export default function parseBinaryEncoding(bytes) {
     }
   }
 
+  var _haveRenderedAsmFuncsCreation = false
+  var _haveRenderedAsmFuncsHeader = false
+  var _haveRenderedAsmFuncsFooter = false
+
+  function renderAsmFuncsCreation() {
+    if (_haveRenderedAsmFuncsCreation) {
+      return
+    }
+    _haveRenderedAsmFuncsCreation = true
+
+    // Create a dynamic call helper for each type signature.
+    if (r.tables.length === 1) {
+      r.types.forEach(function(t) {
+        var sigStr = makeSigStr(t)
+        var args = ["idx"]
+        for (var i = 0; i < t.param_types.length; i++) {
+          args.push("a" + i)
+        }
+        r.putln("imports.call_", sigStr, " = function call_", sigStr, "(", args.join(","), "){")
+        r.putln("  idx = idx >>> 0")
+        r.putln("  if (idx >= T0.length) { imports.trap('table oob') }")
+        r.putln("  var func = T0.get(idx)")
+        r.putln("  if (func === null) { imports.trap('table entry') }")
+        r.putln("  if (func._wasmTypeSigStr) {")
+        r.putln("    if (func._wasmTypeSigStr !== '", sigStr, "') { imports.trap('table sig') }")
+        r.putln("  }")
+        r.putln("  return func(", args.slice(1).join(","), ")")
+        r.putln("}")
+      })
+    }
+
+    // Create unaligned memory-access helpers.
+    // These need to be dynamically created in order
+    // to close over a reference to the heap.
+    r.memories.forEach(function(m, idx) {
+      r.putln("var HDV = new DataView(M", idx, ".buffer)")
+      r.putln("var HU8 = new Uint8Array(M", idx, ".buffer)")
+      if (m.limits.initial !== m.limits.maximum) {
+        r.putln("M", idx, "._onChange(function() {")
+        r.putln("  HU8 = new Uint8Array(M", idx, ".buffer)")
+        r.putln("  HDV = new DataView(M", idx, ".buffer)")
+        r.putln("});")
+      }
+      r.putln("imports.i32_load_unaligned = function(addr) {")
+      r.putln("  return HDV.getInt32(addr, true)")
+      r.putln("}")
+      r.putln("imports.i32_load16_s_unaligned = function(addr) {")
+      r.putln("  return HDV.getInt16(addr, true)")
+      r.putln("}")
+      r.putln("imports.i32_load16_u_unaligned = function(addr) {")
+      r.putln("  return HDV.getInt16(addr, true) & 0x0000FFFF")
+      r.putln("}")
+      r.putln("imports.f32_load_unaligned = function(addr) {")
+      r.putln("  return HDV.getFloat32(addr, true)")
+      r.putln("}")
+      r.putln("imports.f64_load_unaligned = function(addr) {")
+      r.putln("  return HDV.getFloat64(addr, true)")
+      r.putln("}")
+      r.putln("imports.i32_store_unaligned = function(addr, value) {")
+      r.putln("  HDV.setInt32(addr, value, true)")
+      r.putln("}")
+      r.putln("imports.i32_store16_unaligned = function(addr, value) {")
+      r.putln("  HDV.setInt16(addr, value & 0x0000FFFF, true)")
+      r.putln("}")
+      r.putln("imports.f32_store_unaligned = function(addr, value) {")
+      r.putln("  HDV.setFloat32(addr, value, true)")
+      r.putln("}")
+      r.putln("imports.f64_store_unaligned = function(addr, value) {")
+      r.putln("  HDV.setFloat64(addr, value, true)")
+      r.putln("}")
+      r.putln("imports.f32_load_fix_signalling = function(v, addr) {")
+      r.putln("  if (isNaN(v)) {")
+      r.putln("    if (!(HU8[addr + 2] & 0x40)) {")
+      r.putln("      v = new Number(v)")
+      r.putln("      v._signalling = true")
+      r.putln("    }")
+      r.putln("  }")
+      r.putln("  return v")
+      r.putln("}")
+      r.putln("imports.f32_store_fix_signalling = function(v, addr) {")
+      r.putln("  if (isNaN(v)) {")
+      r.putln("    if (typeof v === 'object' && v._signalling) {")
+      r.putln("      HU8[addr + 2] &= ~0x40")
+      r.putln("    }")
+      r.putln("  }")
+      r.putln("}")
+    })
+
+    // Invoke the asmjs sub-function, creating the function objects.
+    if (r.functions.length > 0) {
+      if (r.memories.length === 1) {
+        r.putln("var funcs = asmfuncs(asmlib, imports, M0.buffer)")
+      } else {
+        r.putln("var funcs = asmfuncs(asmlib, imports)")
+      }
+    }
+
+    // Type-tag each returned function.
+    r.functions.forEach(function(f, idx) {
+      r.putln("funcs.", f.name, "._wasmTypeSigStr = '", makeSigStr(getFunctionSignature(idx)), "'")
+      r.putln("funcs.", f.name, "._wasmJSWrapper = null")
+    })
+  }
+
+  function renderAsmFuncsHeader() {
+    if (_haveRenderedAsmFuncsHeader) {
+      return
+    }
+    _haveRenderedAsmFuncsHeader = true
+
+    r.putln("function asmfuncs(stdlib, foreign, heap) {")
+    r.putln("\"use asm\"")
+
+    // Make heap views, if one was given.
+    // If the heap is not growable then we can hard-code
+    // the memory size and remain valid asmjs.
+
+    r.memories.forEach(function(m, idx) {
+      var buf
+      if (idx > 0 || m.limits.initial !== m.limits.maximum) {
+        buf = "M" + idx + ".buffer"
+        r.putln("var memorySize = ", buf, ".byteLength|0")
+      } else {
+        buf = "heap"
+        r.putln("var memorySize = ", m.limits.initial * PAGE_SIZE)
+      }
+      r.putln("var HI8 = new stdlib.Int8Array(", buf, ")")
+      r.putln("var HI16 = new stdlib.Int16Array(", buf, ")")
+      r.putln("var HI32 = new stdlib.Int32Array(", buf, ")")
+      r.putln("var HU8 = new stdlib.Uint8Array(", buf, ")")
+      r.putln("var HU16 = new stdlib.Uint16Array(", buf, ")")
+      r.putln("var HU32 = new stdlib.Uint32Array(", buf, ")")
+      r.putln("var HF32 = new stdlib.Float32Array(", buf, ")")
+      r.putln("var HF64 = new stdlib.Float64Array(", buf, ")")
+      if (m.limits.initial !== m.limits.maximum) {
+        r.putln("M", idx, "._onChange(function() {")
+        r.putln("  memorySize = ", buf, ".byteLength|0")
+        r.putln("  HI8 = new stdlib.Int8Array(", buf, ")")
+        r.putln("  HI16 = new stdlib.Int16Array(", buf, ")")
+        r.putln("  HI32 = new stdlib.Int32Array(", buf, ")")
+        r.putln("  HU8 = new stdlib.Uint8Array(", buf, ")")
+        r.putln("  HU16 = new stdlib.Uint16Array(", buf, ")")
+        r.putln("  HU32 = new stdlib.Uint32Array(", buf, ")")
+        r.putln("  HF32 = new stdlib.Float32Array(", buf, ")")
+        r.putln("  HF64 = new stdlib.Float64Array(", buf, ")")
+        r.putln("});")
+      }
+    })
+
+    // Take local references to our helper functions.
+
+    r.putln("var fround = stdlib.Math.fround")
+    Object.keys(stdlib).forEach(function(key) {
+      r.putln("var ", key, " = foreign.", key)
+    })
+
+    // Take local references to all the imports.
+
+    r.imports.forEach(function(i, idx) {
+      switch (i.kind) {
+	case EXTERNAL_KINDS.FUNCTION:
+          r.putln("var F", i.index, " = foreign.F", i.index)
+	  break
+	case EXTERNAL_KINDS.GLOBAL:
+          switch (i.type.content_type) {
+            case TYPES.I32:
+              r.putln("var G", i.index, " = foreign.G", i.index, "|0")
+              break
+            case TYPES.I64:
+              r.putln("var G", i.index, " = foreign.G", i.index)
+              break
+            case TYPES.F32:
+              r.putln("var G", i.index, " = fround(foreign.G", i.index, ")")
+              break
+            case TYPES.F64:
+              r.putln("var G", i.index, " = +foreign.G", i.index)
+              break
+          }
+	  break
+      }
+    })
+
+    // Take local references to dynamic call helpers.
+
+    if (r.tables.length === 1) {
+      r.types.forEach(function(t) {
+        var sigStr = makeSigStr(t)
+        r.putln("var call_", sigStr, " = foreign.call_", sigStr)
+      })
+    }
+
+    // Take local references to unaligned load/store helpers.
+
+    r.putln("var i32_load_unaligned = foreign.i32_load_unaligned")
+    r.putln("var i32_load16_s_unaligned = foreign.i32_load16_s_unaligned")
+    r.putln("var i32_load16_u_unaligned = foreign.i32_load16_u_unaligned")
+    r.putln("var f32_load_unaligned = foreign.f32_load_unaligned")
+    r.putln("var f64_load_unaligned = foreign.f64_load_unaligned")
+    r.putln("var i32_store_unaligned = foreign.i32_store_unaligned")
+    r.putln("var i32_store16_unaligned = foreign.i32_store16_unaligned")
+    r.putln("var f32_store_unaligned = foreign.f32_store_unaligned")
+    r.putln("var f64_store_unaligned = foreign.f64_store_unaligned")
+    r.putln("var f32_load_fix_signalling = foreign.f32_load_fix_signalling")
+    r.putln("var f32_store_fix_signalling = foreign.f32_store_fix_signalling")
+
+    // Declare all the global variables.
+    // This repeats the declaration of any globals that were exported,
+    // but they're immutable, so whatevz.
+
+    r.globals.forEach(function(g, idx) {
+      if (idx >= r.numImportedGlobals) {
+        switch (g.type.content_type) {
+          case TYPES.I32:
+            r.putln("var G", idx, " = ", g.init.jsexpr, "|0")
+            break
+          case TYPES.I64:
+            r.putln("var G", idx, " = ", g.init.jsexpr)
+            break
+          case TYPES.F32:
+            r.putln("var G", idx, " = fround(", g.init.jsexpr, ")")
+            break
+          case TYPES.F64:
+            r.putln("var G", idx, " = +", g.init.jsexpr)
+            break
+        }
+      }
+    })
+
+    // XXX TODO: if the there's a single, ungrowable table that's
+    // neither imported nor exported, we could declare its contents
+    // inline here and made the generated code faster.
+
+    // That's it, now we can render function definitions.
+  }
+
+  function renderAsmFuncsFooter() {
+    if (_haveRenderedAsmFuncsFooter) {
+      return
+    }
+    _haveRenderedAsmFuncsFooter = true
+    // We return *all* the functions from the asmj module,
+    // so that we can put them into tables etc.
+    r.putln("return {")
+    r.functions.forEach(function(f, idx) {
+      r.putln("  F", idx, ": F", idx, (idx === r.functions.length - 1) ? "" : ",")
+    })
+    r.putln("}")
+    r.putln("}")
+  }
+
   function parseExportSection() {
+    renderAsmFuncsCreation()
+    r.putln("var exports = {}")
+
     var count = s.read_varuint32()
     var seenFields = {}
     while (count > 0) {
@@ -422,10 +688,6 @@ export default function parseBinaryEncoding(bytes) {
     }
 
     function parseExportEntry() {
-      // Note that we render these at the end.
-      // We *could* render them here are rely on function hoisting
-      // to bring the functions into scope, but the rendered code
-      // is more readable if the exports are at the end.
       var e = {}
       var field_len = s.read_varuint32()
       e.field = s.read_bytes(field_len)
@@ -435,11 +697,14 @@ export default function parseBinaryEncoding(bytes) {
       seenFields[e.field] = true
       e.kind = parseExternalKind()
       e.index = s.read_varuint32()
+      var ref = "trap('invalid export')"
       switch (e.kind) {
 	case EXTERNAL_KINDS.FUNCTION:
 	  if (e.index >= r.functions.length) {
 	    throw new CompileError("export of non-existent function")
 	  }
+	  ref = "funcs.F" + e.index
+          r.numExportedFunctions++
 	  break
 	case EXTERNAL_KINDS.GLOBAL:
 	  if (e.index >= r.globals.length) {
@@ -448,26 +713,38 @@ export default function parseBinaryEncoding(bytes) {
 	  if (getGlobalMutability(e.index)) {
 	    throw new CompileError("mutable globals cannot be exported")
 	  }
+          // Exported immutable global, just repeat its declaration
+          // here and in the asmjs sub-function.  Any imported ones
+          // will already have been done by the imports section.
+          if (e.index >= r.numImportedGlobals) {
+            r.putln("var G", e.index, " = ", r.globals[e.index].init.jsexpr)
+          }
+	  ref = "G" + e.index
+          r.numExportedGlobals++
 	  break
 	case EXTERNAL_KINDS.TABLE:
 	  if (e.index >= r.tables.length) {
 	    throw new CompileError("export of non-existent table")
 	  }
+	  ref = "T" + e.index
+          r.numExportedTables++
 	  break
 	case EXTERNAL_KINDS.MEMORY:
 	  if (e.index >= r.memories.length) {
 	    throw new CompileError("export of non-existent memory")
 	  }
+	  ref = "M" + e.index
+          r.numExportedMemories++
 	  break
 	default:
 	  throw new CompileError("unchecked export kind: " + e.kind)
       }
+      r.putln("exports[", renderJSValue(e.field, r.constants), "] = " + ref)
       return e
     }
   }
 
   function parseStartSection() {
-    // Note that we don't render this until the end.
     var func_index = s.read_varuint32()
     var sig = getFunctionSignature(func_index)
     if (sig.param_types.length > 0) {
@@ -483,15 +760,6 @@ export default function parseBinaryEncoding(bytes) {
     var count = s.read_varuint32()
     while (count > 0) {
       var e = parseElementSegment()
-      // Rendering these here means we rely on function hoisting,
-      // but also that we don't need to keep the list of elements around.
-      r.putln("if ((", e.offset.jsexpr, " + ", e.elems.length, ") > T", e.index, ".length) {")
-      r.putln("  throw new TypeError('table out of bounds')")
-      r.putln("}")
-      for (var i = 0; i < e.elems.length; i++) {
-        r.putln("T", e.index, "[(", e.offset.jsexpr, ") + ", i, "] = F", e.elems[i])
-      }
-      delete e.elems
       r.elements.push(e)
       count--
     }
@@ -505,63 +773,30 @@ export default function parseBinaryEncoding(bytes) {
       // Check that it's a valid table reference.
       getTableType(e.index)
       e.offset = parseInitExpr(TYPES.I32)
-      var num_elems = s.read_varuint32()
-      e.elems = []
+      var num_elems = e.num_elems = s.read_varuint32()
+      var elems = []
+      var pos = 0
       while (num_elems > 0) {
-	e.elems.push(s.read_varuint32())
+        elems.push("funcs.F" + s.read_varuint32())
 	num_elems--
+        if (elems.length >= 1024 || num_elems === 0) {
+          r.putln("T", e.index, "._setmany((", e.offset.jsexpr, ") + ", pos, ", [", elems.join(","), "])")
+          pos += elems.length
+          elems = []
+        }
       }
       return e
     }
   }
 
-  function getGlobalType(index) {
-    if (index >= r.globals.length) {
-      throw new CompileError("getGlobalType: no such global: " + index)
-    }
-    return r.globals[index].type.content_type
-  }
-
-  function getGlobalMutability(index) {
-    if (index >= r.globals.length) {
-      throw new CompileError("getGlobalMut: no such global: " + index)
-    }
-    return r.globals[index].type.mutability
-  }
-
-  function getTableType(index) {
-    if (index >= r.tables.length) {
-      throw new CompileError("no such table: " + index)
-    }
-    return r.tables[index]
-  }
-
-  function getMemoryType(index) {
-    if (index >= r.memories.length) {
-      throw new CompileError("no such memory: " + index)
-    }
-    return r.memories[index]
-  }
-
-  function getFunctionSignature(index) {
-    if (index >= r.functions.length) {
-      throw new CompileError("Invalid function index: " + index)
-    }
-    return getTypeSignature(r.functions[index].type)
-  }
-
-  function getTypeSignature(index) {
-    if (index >= r.types.length) {
-      throw new CompileError("Invalid type index: " + index)
-    }
-    return r.types[index]
-  }
-
   function parseCodeSection() {
+
     var count = s.read_varuint32()
     if (count + r.numImportedFunctions !== r.functions.length) {
       throw new CompileError("code section size different to function section size")
     }
+
+    renderAsmFuncsHeader()
     
     var n = r.numImportedFunctions
     while (count > 0) {
@@ -569,6 +804,8 @@ export default function parseBinaryEncoding(bytes) {
       count--
       n++
     }
+
+    renderAsmFuncsFooter()
 
     function parseFunctionBody(index) {
       var f = {}
@@ -635,7 +872,7 @@ export default function parseBinaryEncoding(bytes) {
 	return params.join(",")
       }
 
-      // We represent WASM's "structed stack" as a "stack of stacks".
+      // We represent WASM's "structured stack" as a "stack of stacks".
       // Each time we enter a block, we push a new stack on top of
       // the existing control-flow structures.  Code can only access
       // items from within this top-most stack, not any of the stacks
@@ -867,7 +1104,7 @@ export default function parseBinaryEncoding(bytes) {
 	var initVal = "trap('invalid initial value')"
 	switch (typ) {
 	  case TYPES.I32:
-	    initVal = "0|0"
+	    initVal = "0"
 	    break
 	  case TYPES.I64:
 	    initVal = "Long.ZERO"
@@ -992,13 +1229,13 @@ export default function parseBinaryEncoding(bytes) {
 
       function i32_load_unaligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine(res + " = HDV.getInt32(" + addr + " + " + offset + ", true)")
+	pushLine(res + " = i32_load_unaligned(" + addr + " + " + offset + ")")
       }
 
       function i32_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
 	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-	pushLine("  " + res + " = HDV.getInt32(" + addr + " + " + offset + ", true)")
+	pushLine("  " + res + " = i32_load_unaligned(" + addr + " + " + offset + ")")
 	pushLine("} else {")
 	pushLine("  " + res + " = HI32[(" + addr + " + " + offset + ")>>2]")
 	pushLine("}")
@@ -1014,41 +1251,41 @@ export default function parseBinaryEncoding(bytes) {
 	pushLine(res + " = HU8[(" + addr + " + " + offset + ")]")
       }
 
-      function i32_load16_s_ualigned(addr, offset, value) {
+      function i32_load16_s_unaligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine(res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
+	pushLine(res + " = i32_load16_s_unaligned(" + addr + " + " + offset + ")")
       }
 
-      function i32_load16_u_unaligned(addr, offset, value) {
+      function i32_load16_u_unaligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
-	pushLine(res + " = HDV.getInt16(" + addr + " + " + offset + ", true) & 0x0000FFFF")
+	pushLine(res + " = i32_load16_u_unaligned(" + addr + " + " + offset + ")")
       }
 
-      function i32_load16_s_aligned(addr, offset, value) {
+      function i32_load16_s_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
 	pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
-	pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true)")
+	pushLine("  " + res + " = i32_load16_s_unaligned(" + addr + " + " + offset + ")")
 	pushLine("} else {")
 	pushLine("  " + res + " = HI16[(" + addr + " + " + offset + ")>>1]")
 	pushLine("}")
       }
 
-      function i32_load16_u_aligned(addr, offset, value) {
+      function i32_load16_u_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.I32)
 	pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
-	pushLine("  " + res + " = HDV.getInt16(" + addr + " + " + offset + ", true) & 0x0000FFFF")
+	pushLine("  " + res + " = i32_load16_u_unaligned(" + addr + " + " + offset + ")")
 	pushLine("} else {")
 	pushLine("  " + res + " = HU16[(" + addr + " + " + offset + ")>>1]")
 	pushLine("}")
       }
 
       function i32_store_unaligned(addr, offset, value) {
-	pushLine("HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("i32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
       }
 
       function i32_store_aligned(addr, offset, value) {
 	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-	pushLine("  HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("  i32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
 	pushLine("} else {")
 	pushLine("  HI32[(" + addr + " + " + offset + ")>>2] = " + value)
 	pushLine("}")
@@ -1059,8 +1296,8 @@ export default function parseBinaryEncoding(bytes) {
       }
 
       function i32_store16(addr, offset, value) {
-	pushLine("if ((" + addr + " + " + offset + ") & 0x0F) {")
-	pushLine("  HDV.setInt32(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
+	pushLine("  i32_store16_unaligned(" + addr + " + " + offset + ", " + value + ")")
 	pushLine("} else {")
 	pushLine("  HU16[(" + addr + " + " + offset + ")>>1] = " + value)
 	pushLine("}")
@@ -1068,55 +1305,55 @@ export default function parseBinaryEncoding(bytes) {
 
       function f32_load_unaligned(addr, offset) {
 	var res = pushStackVar(TYPES.F32)
-	pushLine(res + " = HDV.getFloat32(" + addr + " + " + offset + ", true)")
-	pushLine(res + " = f32_load_fix_signalling(" + res + ", HU8, " + addr + " + " + offset + ")")
+	pushLine(res + " = f32_load_unaligned(" + addr + " + " + offset + ")")
+	pushLine(res + " = f32_load_fix_signalling(" + res + ", " + addr + " + " + offset + ")")
       }
 
       function f32_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.F32)
 	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-	pushLine("  " + res + " = HDV.getFloat32(" + addr + " + " + offset + ", true)")
+	pushLine("  " + res + " = f32_load_unaligned(" + addr + " + " + offset + ")")
 	pushLine("} else {")
 	pushLine("  " + res + " = HF32[(" + addr + " + " + offset + ")>>2]")
 	pushLine("}")
-	pushLine(res + " = f32_load_fix_signalling(" + res + ", HU8, " + addr + " + " + offset + ")")
+	pushLine(res + " = f32_load_fix_signalling(" + res + ", " + addr + " + " + offset + ")")
       }
 
       function f32_store_unaligned(addr, offset, value) {
-	pushLine("HDV.setFloat32(" + addr + " + " + offset + ", " + value + ", true)")
-	pushLine("f32_store_fix_signalling(" + value + ", HU8, " + addr + " + " + offset + ")")
+	pushLine("f32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
+	pushLine("f32_store_fix_signalling(" + value + ", " + addr + " + " + offset + ")")
       }
 
       function f32_store_aligned(addr, offset, value) {
 	pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-	pushLine("  HDV.setFloat32(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("  f32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
 	pushLine("} else {")
 	pushLine("  HF32[(" + addr + " + " + offset + ")>>2] = " + value)
 	pushLine("}")
-	pushLine("f32_store_fix_signalling(" + value + ", HU8, " + addr + " + " + offset + ")")
+	pushLine("f32_store_fix_signalling(" + value + ", " + addr + " + " + offset + ")")
       }
 
       function f64_load_unaligned(addr, offset) {
 	var res = pushStackVar(TYPES.F64)
-	pushLine(res + " = HDV.getFloat64(" + addr + " + " + offset + ", true)")
+	pushLine(res + " = f64_load_unaligned(" + addr + " + " + offset + ")")
       }
 
       function f64_load_aligned(addr, offset) {
 	var res = pushStackVar(TYPES.F64)
 	pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
-	pushLine("  " + res + " = HDV.getFloat64(" + addr + " + " + offset + ", true)")
+	pushLine("  " + res + " = f64_load_unaligned(" + addr + " + " + offset + ")")
 	pushLine("} else {")
 	pushLine("  " + res + " = HF64[(" + addr + " + " + offset + ")>>3]")
 	pushLine("}")
       }
 
       function f64_store_unaligned(addr, offset, value) {
-	pushLine("HDV.setFloat64(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("f64_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
       }
 
       function f64_store_aligned(addr, offset, value) {
 	pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
-	pushLine("  HDV.setFloat64(" + addr + " + " + offset + ", " + value + ", true)")
+	pushLine("  f64_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
 	pushLine("} else {")
 	pushLine("  HF64[(" + addr + " + " + offset + ")>>3] = " + value)
 	pushLine("}")
@@ -1125,6 +1362,7 @@ export default function parseBinaryEncoding(bytes) {
       function i64_from_i32_s() {
 	var low32 = popStackVar(TYPES.I32)
 	var res = pushStackVar(TYPES.I64)
+        // Sign-extend into 64 bits
 	pushLine("if (" + low32 + " & 0x80000000) {")
 	pushLine("  " + res + " = new Long(" + low32 + ", -1)")
 	pushLine("} else {")
@@ -1447,24 +1685,14 @@ export default function parseBinaryEncoding(bytes) {
 	    var callIdx = popStackVar(TYPES.I32)
 	    // The rightmost arg is the one on top of stack,
 	    // so we have to pop them in reverse.
-	    var args = new Array(callSig.param_types.length)
+	    var args = new Array(callSig.param_types.length + 1)
+            args[0] = callIdx
 	    for (var i = callSig.param_types.length - 1; i >= 0; i--) {
-	      args[i] = popStackVar(callSig.param_types[i])
+	      args[i + 1] = popStackVar(callSig.param_types[i])
 	    }
-	    // XXX TODO: how to dynamically check call signature?
-	    // Shall we just always call a stub that does this for us?
-	    // Shall we use asmjs-style signature-specific tables with
-	    // placeholders that trap?
-	    // For now we just do a bunch of explicit checks.
-	    pushLine("if (!T0[" + callIdx + "]) {")
-	    pushLine("  trap('table OOB')")
-	    pushLine("}")
-	    pushLine("if (T0[" + callIdx + "]._wasmTypeSigStr) {")
-	    pushLine("  if (T0[" + callIdx + "]._wasmTypeSigStr != '" + makeSigStr(callSig) + "') {")
-	    pushLine("    trap('table sig')")
-	    pushLine("  }")
-	    pushLine("}")
-	    var call = "T0[" + callIdx + "](" + args.join(",") + ")"
+            // XXX TODO: in some cases we could use asmjs type-specific function tables here.
+            // For now we just delegate to an externally-defined helper.
+	    var call = "call_" + makeSigStr(callSig) + "(" + args.join(",") + ")"
 	    if (callSig.return_types.length === 0) {
 	      pushLine(call)
 	    } else {
@@ -1516,7 +1744,7 @@ export default function parseBinaryEncoding(bytes) {
 	    var index = s.read_varuint32()
 	    var typ = getLocalType(index)
 	    pushLine(getLocalVar(index) + " = " + popStackVar(typ))
-	    pushStackVar(typ) // this var will already contain the previous value
+	    pushStackVar(typ) // this var will already contain the value we just set
 	    break
 
 	  case OPCODES.GET_GLOBAL:
@@ -2607,8 +2835,6 @@ export default function parseBinaryEncoding(bytes) {
         })
       })
       r.putln("}")
-      r.putln(f.name, "._wasmTypeSigStr = '", f.sigStr, "'")
-      pushLine(f.name, "._wasmJSWrapper = null")
       return c
     }
   }
@@ -2639,13 +2865,14 @@ export default function parseBinaryEncoding(bytes) {
     r.putln("if ((", d.offset.jsexpr, " + ", size, ") > M0.buffer.byteLength) {")
     r.putln("  throw new TypeError('memory out of bounds')")
     r.putln("}")
+    r.putln("var mb = new Uint8Array(M0.buffer)")
     var bytes = []
     var pos = 0
     while (size > 0) {
       bytes.push(s.read_byte())
       size--
       if (bytes.length >= 1024 || size === 0) {
-        r.putln("HI8.set([", bytes.join(","), "], (", d.offset.jsexpr, ") + ", pos, ")")
+        r.putln("mb.set([", bytes.join(","), "], (", d.offset.jsexpr, ") + ", pos, ")")
         pos += bytes.length
         bytes = []
       }
@@ -2654,34 +2881,60 @@ export default function parseBinaryEncoding(bytes) {
   }
 
   function renderJSFooter() {
-    // Run the `start` function if it exists.
+    renderAsmFuncsCreation()
+    renderAsmFuncsHeader()
+    renderAsmFuncsFooter()
     if (r.start !== null) {
-      r.putln("F", r.start, "()")
+      r.putln("funcs.F", r.start, "()")
     }
-
-    // Return the exports as an object.
-    r.putln("var exports = {}")
-    r.exports.forEach(function(e, idx) {
-      var ref = "trap('invalid export')"
-      switch (e.kind) {
-	case EXTERNAL_KINDS.FUNCTION:
-	  ref = "F" + e.index
-	  break
-	case EXTERNAL_KINDS.GLOBAL:
-	  ref = "G" + e.index
-	  break
-	case EXTERNAL_KINDS.MEMORY:
-	  ref = "M" + e.index
-	  break
-	case EXTERNAL_KINDS.TABLE:
-	  ref = "T" + e.index
-	  break
-      }
-      r.putln("exports[", renderJSValue(e.field, r.constants), "] = " + ref)
-    })
-    r.putln("return exports")
-
+    if (r.exports.length > 0) {
+      r.putln("return exports")
+    } else {
+      r.putln("return {}")
+    }
     r.putln("})")
+  }
+
+  function getGlobalType(index) {
+    if (index >= r.globals.length) {
+      throw new CompileError("getGlobalType: no such global: " + index)
+    }
+    return r.globals[index].type.content_type
+  }
+
+  function getGlobalMutability(index) {
+    if (index >= r.globals.length) {
+      throw new CompileError("getGlobalMut: no such global: " + index)
+    }
+    return r.globals[index].type.mutability
+  }
+
+  function getTableType(index) {
+    if (index >= r.tables.length) {
+      throw new CompileError("no such table: " + index)
+    }
+    return r.tables[index]
+  }
+
+  function getMemoryType(index) {
+    if (index >= r.memories.length) {
+      throw new CompileError("no such memory: " + index)
+    }
+    return r.memories[index]
+  }
+
+  function getFunctionSignature(index) {
+    if (index >= r.functions.length) {
+      throw new CompileError("Invalid function index: " + index)
+    }
+    return getTypeSignature(r.functions[index].type)
+  }
+
+  function getTypeSignature(index) {
+    if (index >= r.types.length) {
+      throw new CompileError("Invalid type index: " + index)
+    }
+    return r.types[index]
   }
 
 }
@@ -2901,6 +3154,11 @@ function ParseResult(bytes) {
   this.datas = []
   this.start = null
   this.numImportedFunctions = 0
+  this.numImportedGlobals = 0
+  this.numExportedFunctions = 0
+  this.numExportedGlobals = 0
+  this.numExportedTables = 0
+  this.numExportedMemories = 0
 }
 
 ParseResult.prototype.putc = function putc(c) {
