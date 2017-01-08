@@ -1,6 +1,6 @@
 
 
-import translate from "./translate"
+import translate from "./translate/index"
 import { dump, filename } from "./utils"
 
 //

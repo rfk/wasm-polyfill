@@ -82,13 +82,12 @@ var scratchBuf = new ArrayBuffer(8)
 var scratchBytes = new Uint8Array(scratchBuf)
 var scratchData = new DataView(scratchBuf)
 
-export function renderJSValue(v, constants) {
+export function stringifyJSValue(v) {
   // We need to preserve two things that don't round-trip through v.toString():
   //  * the distinction between -0 and 0
   //  * the precise bit-pattern of an NaN
   if (typeof v === "number" || (typeof v === "object" && v instanceof Number)) {
     if (isNaN(v)) {
-      // XXX TODO: re-work this to just pass it in as a constant
       scratchData.setFloat64(0, v, true)
       return "WebAssembly._fromNaNBytes([" + scratchBytes.join(",") + "]," + (!!v._signalling) + ")"
     }
@@ -98,18 +97,28 @@ export function renderJSValue(v, constants) {
   if (v instanceof Long) {
     return "new Long(" + v.low + "," + v.high + ")"
   }
-  // Quote simple strings directly, but place more complex ones
-  // as constants so that we don't have to try to escape them.
+  // Quote strings, with liberal escaping for safely.
   if (typeof v === 'string') {
-    if (/^[A-Za-z0-9_ $-]*$/.test(v)) {
-      return "'" + v + "'"
+    var quoted = "'"
+    for (var i = 0; i < v.length; i++) {
+      var c = v.charCodeAt(i)
+      // Trivial characters == ASCII printables, above single-quote and below delete,
+      // and excluding backslash.  Everything else gets unicode-escaped.
+      if (c > 39 && c < 127 && c !== 92) {
+        quoted += v.charAt(i)
+      } else {
+        var escd = c.toString(16)
+        while (escd.length < 4) {
+          escd = "0" + escd
+        }
+        quoted += "\\u" + escd
+      }
     }
-    constants.push(v)
-    return "constants[" + (constants.length - 1) + "]"
+    quoted += "'"
+    return quoted
   }
-  // Everything else just renders as a string.
+  // We're not expecting anything else.
   throw new CompileError('rendering unknown type of value: ' + (typeof v) + " : " + v)
-  return v
 }
 
 export function _fromNaNBytes(bytes, isSignalling) {
@@ -159,7 +168,7 @@ export function dump() {
     if (typeof arg === 'string') {
       process.stderr.write(arg)
     } else if (typeof arg === 'number' || (arg instanceof Number)) {
-      process.stderr.write(renderJSValue(arg))
+      process.stderr.write(stringifyJSValue(arg))
     } else {
       process.stderr.write(JSON.stringify(arg))
     }

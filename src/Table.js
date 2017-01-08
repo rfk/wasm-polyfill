@@ -5,6 +5,7 @@
 // JavaScript array.
 //
 
+import { RuntimeError } from "./errors"
 import {
   assertIsDefined,
   assertIsInstance,
@@ -73,6 +74,14 @@ Table.prototype.set = function set(index, value) {
     throw RangeError
   }
   this._internals.values[index] = value
+}
+
+Table.prototype._get = function get(index) {
+  var entry = this._internals.values[index]
+  if (! entry) {
+    throw new RuntimeError("invalid table entry at " + index)
+  }
+  return entry
 }
 
 Table.prototype._setmany = function _setmany(start, values) {

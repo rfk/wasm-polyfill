@@ -2,7 +2,7 @@
 .PHONY: all
 all: wasm-polyfill.min.js webextension
 
-wasm-polyfill.min.js: src/*.js node_modules/long/package.json
+wasm-polyfill.min.js: src/*.js src/translate/*.js node_modules/long/package.json
 	./node_modules/.bin/rollup -c
 
 spec/interpreter/README.md:

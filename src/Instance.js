@@ -134,7 +134,7 @@ export default function Instance(moduleObject, importObject) {
     Float64Array: Float64Array,
     Math: Math
   }
-  this._exports = r.jsmodule(WebAssembly, r.constants, asmlib, imports)
+  this._exports = r.jsmodule(WebAssembly, asmlib, imports)
   this.exports = {}
   var self = this;
   r.exports.forEach(function(e) {
