@@ -12,37 +12,42 @@ export function trap(msg) {
   throw new RuntimeError(msg || "it's a trap!")
 }
 
-export function assertIsDefined(obj) {
+export function assertIsDefined(obj, Err) {
+  Err = Err || TypeError
   if (typeof obj === "undefined") {
-    throw new TypeError()
+    throw new Err()
   }
 }
 
-export function assertIsInstance(obj, Cls) {
+export function assertIsInstance(obj, Cls, Err) {
+  Err = Err || TypeError
   if (!(obj instanceof Cls)) {
-    throw new TypeError()
+    throw new Err()
   }
 }
 
-export function assertIsType(obj, typstr) {
+export function assertIsType(obj, typstr, Err) {
+  Err = Err || TypeError
   if (typeof obj !== typstr) {
-    throw new TypeError()
+    throw new Err()
   }
 }
 
-export function assertIsCallable(obj) {
+export function assertIsCallable(obj, Err) {
+  Err = Err || TypeError
   // XXX TODO: more complicated cases
   if (typeof obj !== "function" ) {
-    throw new TypeError()
+    throw new Err()
   }
 }
 
-export function ToWASMValue(jsValue, typ) {
+export function ToWASMValue(jsValue, typ, Err) {
+  Err = Err || TypeError
   if (typeof jsValue === "undefined") {
     return 0
   }
   if (typeof jsValue !== 'number' && ! (jsValue instanceof Number)) {
-    throw new TypeError("cant pass non-number in to WASM")
+    throw new Err("cant pass non-number in to WASM")
   }
   switch (typ) {
     case TYPES.I32:
@@ -54,7 +59,7 @@ export function ToWASMValue(jsValue, typ) {
     case TYPES.F64:
       return +jsValue
     default:
-      throw new TypeError("Unknown type: " + typ)
+      throw new Err("Unknown type: " + typ)
   }
 }
 
@@ -80,6 +85,7 @@ export function ToNonWrappingUint32(v) {
 
 var scratchBuf = new ArrayBuffer(8)
 var scratchBytes = new Uint8Array(scratchBuf)
+var scratchInts = new Uint32Array(scratchBuf)
 var scratchData = new DataView(scratchBuf)
 
 export function stringifyJSValue(v) {
@@ -88,8 +94,14 @@ export function stringifyJSValue(v) {
   //  * the precise bit-pattern of an NaN
   if (typeof v === "number" || (typeof v === "object" && v instanceof Number)) {
     if (isNaN(v)) {
-      scratchData.setFloat64(0, v, true)
-      return "WebAssembly._fromNaNBytes([" + scratchBytes.join(",") + "]," + (!!v._signalling) + ")"
+      if (typeof v === "object") {
+        return "WebAssembly._toBoxedNaN(" + stringifyJSValue(v._wasmBitPattern) + ")"
+      } else {
+        scratchData.setFloat64(0, v, true)
+        var low = scratchData.getInt32(0, true)
+        var high = scratchData.getInt32(4, true)
+        return "WebAssembly._toBoxedNaN(new Long(" + low + ", " + high + "))"
+      }
     }
     return "" + (((v < 0 || 1 / v < 0) ? "-" : "") + Math.abs(v))
   }
@@ -121,16 +133,24 @@ export function stringifyJSValue(v) {
   throw new CompileError('rendering unknown type of value: ' + (typeof v) + " : " + v)
 }
 
-export function _fromNaNBytes(bytes, isSignalling) {
-  for (var i = 0; i < 8; i++) {
-    scratchBytes[i] = bytes[i]
+export function _toBoxedNaN(wasmBitPattern) {
+  if (typeof wasmBitPattern === "number") {
+    scratchData.setInt32(0, wasmBitPattern, true)
+    var res = scratchData.getFloat32(0, true)
+    if (isNaNPreserving32) {
+      return res
+    }
+  } else {
+    scratchData.setInt32(0, wasmBitPattern.low, true)
+    scratchData.setInt32(4, wasmBitPattern.high, true)
+    var res = scratchData.getFloat64(0, true)
+    if (isNaNPreserving64) {
+      return res
+    }
   }
-  var v = scratchData.getFloat64(0, true)
-  if (isSignalling) {
-    v = new Number(v)
-    v._signalling = true
-  }
-  return v
+  res = new Number(res)
+  res._wasmBitPattern = wasmBitPattern
+  return res
 }
 
 export function makeSigStr(funcSig) {
@@ -161,7 +181,9 @@ export function makeSigStr(funcSig) {
 
 export function dump() {
   if (typeof process === "undefined" || ! process.stderr) {
-    return console.log.apply(console, arguments)
+    if (typeof console !== "undefined") {
+      return console.log.apply(console, arguments)
+    }
   }
   for (var i = 0; i < arguments.length; i++) {
     var arg = arguments[i]
@@ -196,3 +218,54 @@ export function filename() {
 
   throw new RuntimeError("could not determine script filename")
 }
+
+export function inherits(Cls, Base, methods) {
+  Cls.prototype = Object.create(Base.prototype)
+  if (methods) {
+    Object.keys(methods).forEach(function(key) {
+      Cls.prototype[key] = methods[key]
+    })
+  }
+}
+
+// Feature-detect some subtleties of browser/platform behaviour.
+
+// Are TypedArrays little-endian on this platform?
+
+export var isLittleEndian
+scratchInts[0] = 0x0000FFFF
+if (scratchBytes[0] === 0xFF) {
+  isLittleEndian = true
+} else {
+  isLittleEndian = false
+}
+
+// Does the VM canonicalize 64-bit NaNs?
+// V8 doesn't, but SpiderMonkey does.
+
+export var isNaNPreserving64 = false
+scratchInts[0] = 0xFFFFFFFF
+scratchInts[1] = 0xFFF7FFFF
+scratchData.setFloat64(0, scratchData.getFloat64(0, true), true)
+if (scratchInts[0] === 0xFFFFFFFF && scratchInts[1] === 0xFFF7FFFF) {
+  scratchInts[1] = 0xFFFFFFFF
+  scratchData.setFloat64(0, scratchData.getFloat64(0, true), true)
+  if (scratchInts[0] === 0xFFFFFFFF && scratchInts[1] === 0xFFFFFFFF) {
+    isNaNPreserving64 = true
+  }
+}
+
+// Does the VM canonicalize 32-bit NaNs?
+// It seems that they all do, at least by setting the quiet bit..?
+
+export var isNaNPreserving32 = false
+scratchInts[0] = 0xFFBFFFFF
+scratchData.setFloat32(0, scratchData.getFloat32(0, true), true)
+if (scratchInts[0] === 0xFFBFFFFF) {
+  scratchInts[0] = 0xFFFFFFFF
+  scratchData.setFloat32(0, scratchData.getFloat32(0, true), true)
+  if (scratchInts[0] === 0xFFFFFFFF) {
+    isNaNPreserving32 = true
+  }
+}
+

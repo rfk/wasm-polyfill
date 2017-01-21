@@ -41,19 +41,15 @@ function mkSpecTestRunner(filename) {
 
       // Add hooks to make it correctly call the polyfill.
       testCode = testCode.replace("soft_validate = true", "soft_validate = false")
-      testCode = "'use strict'\n" +
-                 "var WebAssembly = require('" + CODEFILE + "')\n" +
-                 "function print() {\n" +
-                 "  for (var i = 0; i < arguments.length; i++) {\n" +
-                 "    console.log(arguments[i])\n" +
-                 "  }\n" +
-                 "}\n" +
+      testCode = "'use strict';\n" +
+                 fs.readFileSync(CODEFILE) + "\n" +
                  testCode
       fs.writeFileSync(testFile, testCode)
 
       // Run it with a subprocess, capturing output.
       var output = ""
-      var proc = cp.spawn('node', [testFile], { stdio: [process.stdin, 'pipe', process.stderr] })
+      var js_engine = process.env.JS_ENGINE || 'node'
+      var proc = cp.spawn(js_engine, [testFile], { stdio: [process.stdin, 'pipe', process.stderr] })
       proc.stdout.on('data', function(chunk) {
         output += chunk.toString()
       })

@@ -46,11 +46,11 @@ export default function Instance(moduleObject, importObject) {
     assertIsInstance(o, Object)
     var v = o[i.item_name]
     if (typeof v === "undefined") {
-      throw new TypeError("cannot import undefined")
+      throw new LinkError("cannot import undefined")
     }
     switch(i.kind) {
       case EXTERNAL_KINDS.FUNCTION:
-        assertIsCallable(v)
+        assertIsCallable(v, LinkError)
         if (! v._wasmRawFunc) {
           // If this is not a function from another WASM instance, then we
           // have to convert args and return values between WASM and JS semantics.
@@ -73,48 +73,48 @@ export default function Instance(moduleObject, importObject) {
           // If importing functions from another WASM instance,
           // we can shortcut *and* we can do more typechecking.
           if (v._wasmRawFunc._wasmTypeSigStr !== makeSigStr(r.types[i.type])) {
-            throw new TypeError("function import type mis-match")
+            throw new LinkError("function import type mis-match")
           }
           imports["F" + numFuncsDone] = v._wasmRawFunc
         }
         numFuncsDone++
         break
       case EXTERNAL_KINDS.GLOBAL:
-        imports["G" + numGlobalsDone] = ToWASMValue(v, i.type.content_type)
+        imports["G" + numGlobalsDone] = ToWASMValue(v, i.type.content_type, LinkError)
         numGlobalsDone++
         break
       case EXTERNAL_KINDS.MEMORY:
-        assertIsInstance(v, Memory)
+        assertIsInstance(v, Memory, LinkError)
         if (v._internals.current < i.type.limits.initial) {
-          throw new TypeError("memory import too small")
+          throw new LinkError("memory import too small")
         }
         if (i.type.limits.maximum) {
           if (v._internals.current > i.type.limits.maximum) {
-            throw new TypeError("memory import too big")
+            throw new LinkError("memory import too big")
           }
           if (!v._internals.maximum || v._internals.maximum > i.type.limits.maximum) {
-            throw new TypeError("memory import has too large a maximum")
+            throw new LinkError("memory import has too large a maximum")
           }
         }
         imports["M0"] = v
         break
       case EXTERNAL_KINDS.TABLE:
-        assertIsInstance(v, Table)
+        assertIsInstance(v, Table, LinkError)
         if (v.length < i.type.limits.initial) {
-          throw new TypeError("table import too small")
+          throw new LinkError("table import too small")
         }
         if (i.type.limits.maximum) {
           if (v.length > i.type.limits.maximum) {
-            throw new TypeError("table import too big")
+            throw new LinkError("table import too big")
           }
           if (!v._internals.maximum || v._internals.maximum > i.type.limits.maximum) {
-            throw new TypeError("table import has too large a maximum")
+            throw new LinkError("table import has too large a maximum")
           }
         }
         imports["T0"] = v
         break
       default:
-        throw new RuntimeError("unexpected import kind: " + i.kind)
+        throw new LinkError("unexpected import kind: " + i.kind)
     }
   })
 
@@ -169,19 +169,7 @@ export default function Instance(moduleObject, importObject) {
                   throw new RuntimeError("malformed _wasmTypeSigStr")
               }
             }
-            try {
-              return wasmFunc.apply(this, args)
-            } catch (err) {
-              // For test compatibilty, we want stack space exhaustion to trap.
-              // XXX TODO: this can't really be necessary in practice, right?
-              // Surely just passing through the RangeError would suffice?
-              if (err instanceof RangeError) {
-                if (err.message.indexOf("call stack") >= 0) {
-                  throw new RuntimeError("call stack exhausted")
-                }
-              }
-              throw err
-            }
+            return wasmFunc.apply(this, args)
           }
           wasmFunc._wasmJSWrapper._wasmRawFunc = wasmFunc
         }

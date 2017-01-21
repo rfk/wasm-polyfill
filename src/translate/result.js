@@ -45,6 +45,7 @@ TranslationResult.prototype.putc = function putc(c) {
 }
 
 TranslationResult.prototype.putstr = function putstr(s) {
+  s = "" + s
   //s = s.trim()
   for (var i = 0; i < s.length; i++) {
     this.putc(s.charCodeAt(i))

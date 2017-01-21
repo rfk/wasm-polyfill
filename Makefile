@@ -8,7 +8,7 @@ wasm-polyfill.min.js: src/*.js src/translate/*.js node_modules/long/package.json
 spec/interpreter/README.md:
 	git submodule update --init
 
-spec/interpreter/wasm: spec/interpreter/README.md
+spec/interpreter/wasm: spec/interpreter/README.md .git/modules/spec/*
 	cd ./spec/interpreter && make
 
 node_modules/long/package.json:

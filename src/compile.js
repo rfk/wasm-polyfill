@@ -13,7 +13,9 @@ import { dump, filename } from "./utils"
 export function compileSync(bufferSource) {
   var bytes = new Uint8Array(arrayBufferFromBufferSource(bufferSource))
   var r = translate(bytes)
-  //dump((new Buffer(r.bytes)).toString())
+//  dump("------")
+//  dump((new Buffer(r.bytes)).toString())
+//  dump("------")
   r.jsmodule = loadSync(r.bytes)
   return r
 }

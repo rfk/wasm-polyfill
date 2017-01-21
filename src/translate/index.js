@@ -4,7 +4,7 @@
 // This is a fairly straightforward procedural parser for the WASM
 // binary format.  It generates an object with the following properties:
 //
-//   XXX TODO: complete this after refactoring
+//   XXX TODO: re-work this after refactoring
 //
 //  function (WebAssembly, imports) {
 //
@@ -227,7 +227,7 @@ function parseInitExpr(s, r, typ) {
       if (r.globals[index].type.mutability) {
         throw new CompileError("init_expr refers to mutable global")
       }
-      e.jsexpr = "G" + index
+      e.jsexpr = "G" + typeToNameSuffix(typ) + index
       break
     default:
       throw new CompileError("Unsupported init expr opcode: 0x" + e.op.toString(16))
@@ -367,7 +367,7 @@ function translateImportEntry(s, r) {
         throw new CompileError("mutable globals cannot be imported")
       }
       i.index = r.numImportedGlobals++
-      r.putln("var G", i.index, " = imports.G", i.index)
+      r.putln("var G", typeToNameSuffix(i.type.content_type), i.index, " = imports.G", i.index)
       r.globals.push(i)
       break
     // Imported tables and memories get rendered directly here, at the
@@ -525,16 +525,14 @@ function translateExportEntry(s, r, seenFields) {
       // repeat its declaration here and in the inner asmjs function.
       // Careful though, any imported globals will already have been
       // rendered by the import section.
-      if (e.index >= r.globals.length) {
-        throw new CompileError("export of non-existent global")
-      }
+      var typ = r.getGlobalTypeByIndex(e.index)
       if (r.getGlobalMutabilityByIndex(e.index)) {
         throw new CompileError("mutable globals cannot be exported")
       }
       if (e.index >= r.numImportedGlobals) {
-        r.putln("var G", e.index, " = ", r.globals[e.index].init.jsexpr)
+        r.putln("var G", typeToNameSuffix(typ), e.index, " = ", r.globals[e.index].init.jsexpr)
       }
-      ref = "G" + e.index
+      ref = "G" + typeToNameSuffix(typ) + e.index
       r.numExportedGlobals++
       break
     case EXTERNAL_KINDS.TABLE:
@@ -583,7 +581,9 @@ function translateStartSection(s, r) {
 //
 // The "element" section is a list of element segments, each
 // of which is a list of function indices to set in a particular
-// table.  We render these immediately
+// table.  We can emit bounds-checks immediately, but we mustn't
+// render code to populate the table until the very end, so that
+// linking errors don't leave it partially initialized.
 //
 
 function translateElementSection(s, r) {
@@ -605,18 +605,15 @@ function translateElementSegment(s, r) {
   r.getTableTypeByIndex(e.table)
   e.offset = parseInitExpr(s, r, TYPES.I32)
   var num_elems = e.num_elems = s.read_varuint32()
-  // We use a helper funtion on the Table class to add elements to it
-  // in batches, to reduce the amount of code we have to spit out.
-  var elems = []
-  var pos = 0
+  r.putln("if (", e.offset.jsexpr, " + ", num_elems, " > T", e.table, ".length) {")
+  r.putln("  throw new WebAssembly.LinkError('table out-of-bounds')")
+  r.putln("}")
+  e.elems = []
   while (num_elems > 0) {
-    elems.push("funcs.F" + s.read_varuint32())
+    var func_index = s.read_varuint32()
+    r.getFunctionTypeSignatureByIndex(func_index)
+    e.elems.push(func_index)
     num_elems--
-    if (elems.length >= 1024 || num_elems === 0) {
-      r.putln("T", e.table, "._setmany((", e.offset.jsexpr, ") + ", pos, ", [", elems.join(","), "])")
-      pos += elems.length
-      elems = []
-    }
   }
   r.elements.push(e)
 }
@@ -702,25 +699,13 @@ function translateDataSegment(s, r) {
   r.getMemoryTypeByIndex(d.index)
   d.offset = parseInitExpr(s, r, TYPES.I32)
   var size = d.size = s.read_varuint32()
-  if (size === 0) {
-    return d
-  }
-  // Read the bytes and render the set operation in chunks, to reduce
-  // the amount of JS we have spit out.
   r.putln("if ((", d.offset.jsexpr, " + ", size, ") > M0.buffer.byteLength) {")
-  r.putln("  throw new TypeError('memory out of bounds')")
+  r.putln("  throw new WebAssembly.LinkError('memory out of bounds')")
   r.putln("}")
-  r.putln("var mb = new Uint8Array(M0.buffer)")
-  var bytes = []
-  var pos = 0
+  d.bytes = []
   while (size > 0) {
-    bytes.push(s.read_byte())
+    d.bytes.push(s.read_byte())
     size--
-    if (bytes.length >= 1024 || size === 0) {
-      r.putln("mb.set([", bytes.join(","), "], (", d.offset.jsexpr, ") + ", pos, ")")
-      pos += bytes.length
-      bytes = []
-    }
   }
   r.datas.push(d)
 }
@@ -782,10 +767,8 @@ function renderAsmFuncCreation(r) {
 
   r.memories.forEach(function(m, idx) {
     r.putln("var HDV = new DataView(M", idx, ".buffer)")
-    r.putln("var HU8 = new Uint8Array(M", idx, ".buffer)")
     if (m.limits.initial !== m.limits.maximum) {
       r.putln("M", idx, "._onChange(function() {")
-      r.putln("  HU8 = new Uint8Array(M", idx, ".buffer)")
       r.putln("  HDV = new DataView(M", idx, ".buffer)")
       r.putln("});")
     }
@@ -816,24 +799,38 @@ function renderAsmFuncCreation(r) {
     r.putln("imports.f64_store_unaligned = function(addr, value) {")
     r.putln("  HDV.setFloat64(addr, value, true)")
     r.putln("}")
-    // XXX TODO: nodejs doesn't do NaN-boxing, so the only NaN bit
-    // it has trouble maintaining it the signalling bit.  This will
-    // need to be re-worked to maintain the full bit-pattern on other
-    // JS engines that use NaN-boxing, like spidermonkey.
-    r.putln("imports.f32_load_fix_signalling = function(v, addr) {")
-    r.putln("  if (isNaN(v)) {")
-    r.putln("    if (!(HU8[addr + 2] & 0x40)) {")
-    r.putln("      v = new Number(v)")
-    r.putln("      v._signalling = true")
-    r.putln("    }")
+    // For JS engines that canonicalize NaNs, we need to jump through
+    // some hoops to preserve precise NaN bitpatterns.  We do this
+    // by boxing it into a Number() and attaching the precise bit pattern
+    // as integer properties on this object.
+    r.putln("var f32_isNaN = imports.f32_isNaN")
+    r.putln("var f64_isNaN = imports.f64_isNaN")
+    r.putln("imports.f32_load_nan_bitpattern = function(v, addr) {")
+    r.putln("  if (f32_isNaN(v)) {")
+    r.putln("    v = new Number(v)")
+    r.putln("    v._wasmBitPattern = HDV.getInt32(addr, true)")
     r.putln("  }")
     r.putln("  return v")
     r.putln("}")
-    r.putln("imports.f32_store_fix_signalling = function(v, addr) {")
-    r.putln("  if (isNaN(v)) {")
-    r.putln("    if (typeof v === 'object' && v._signalling) {")
-    r.putln("      HU8[addr + 2] &= ~0x40")
-    r.putln("    }")
+    r.putln("imports.f32_store_nan_bitpattern = function(v, addr) {")
+    r.putln("  if (typeof v === 'object' && v._wasmBitPattern) {")
+    r.putln("    HDV.setInt32(addr, v._wasmBitPattern, true)")
+    r.putln("  }")
+    r.putln("}")
+    r.putln("imports.f64_load_nan_bitpattern = function(v, addr) {")
+    r.putln("  if (f64_isNaN(v)) {")
+    r.putln("    v = new Number(v)")
+    r.putln("    v._wasmBitPattern = new Long(")
+    r.putln("      HDV.getInt32(addr, true),")
+    r.putln("      HDV.getInt32(addr + 4, true)")
+    r.putln("    )")
+    r.putln("  }")
+    r.putln("  return v")
+    r.putln("}")
+    r.putln("imports.f64_store_nan_bitpattern = function(v, addr) {")
+    r.putln("  if (typeof v === 'object' && v._wasmBitPattern) {")
+    r.putln("    HDV.setInt32(addr, v._wasmBitPattern.low, true)")
+    r.putln("    HDV.setInt32(addr + 4, v._wasmBitPattern.high, true)")
     r.putln("  }")
     r.putln("}")
   })
@@ -927,16 +924,16 @@ function renderAsmFuncHeader(r) {
       case EXTERNAL_KINDS.GLOBAL:
         switch (i.type.content_type) {
           case TYPES.I32:
-            r.putln("var G", i.index, " = foreign.G", i.index, "|0")
+            r.putln("var Gi", i.index, " = foreign.G", i.index, "|0")
             break
           case TYPES.I64:
-            r.putln("var G", i.index, " = foreign.G", i.index)
+            r.putln("var Gl", i.index, " = foreign.G", i.index)
             break
           case TYPES.F32:
-            r.putln("var G", i.index, " = fround(foreign.G", i.index, ")")
+            r.putln("var Gf", i.index, " = fround(foreign.G", i.index, ")")
             break
           case TYPES.F64:
-            r.putln("var G", i.index, " = +foreign.G", i.index)
+            r.putln("var Gd", i.index, " = +foreign.G", i.index)
             break
         }
         break
@@ -963,8 +960,10 @@ function renderAsmFuncHeader(r) {
   r.putln("var i32_store16_unaligned = foreign.i32_store16_unaligned")
   r.putln("var f32_store_unaligned = foreign.f32_store_unaligned")
   r.putln("var f64_store_unaligned = foreign.f64_store_unaligned")
-  r.putln("var f32_load_fix_signalling = foreign.f32_load_fix_signalling")
-  r.putln("var f32_store_fix_signalling = foreign.f32_store_fix_signalling")
+  r.putln("var f32_store_nan_bitpattern = foreign.f32_store_nan_bitpattern")
+  r.putln("var f32_load_nan_bitpattern = foreign.f32_load_nan_bitpattern")
+  r.putln("var f64_store_nan_bitpattern = foreign.f64_store_nan_bitpattern")
+  r.putln("var f64_load_nan_bitpattern = foreign.f64_load_nan_bitpattern")
 
   // Declare all the global variables.
   // This repeats the declaration of any globals that were imported/exported,
@@ -974,16 +973,16 @@ function renderAsmFuncHeader(r) {
     if (idx >= r.numImportedGlobals) {
       switch (g.type.content_type) {
         case TYPES.I32:
-          r.putln("var G", idx, " = ", g.init.jsexpr, "|0")
+          r.putln("var Gi", idx, " = ", g.init.jsexpr, "|0")
           break
         case TYPES.I64:
-          r.putln("var G", idx, " = ", g.init.jsexpr)
+          r.putln("var Gl", idx, " = ", g.init.jsexpr)
           break
         case TYPES.F32:
-          r.putln("var G", idx, " = fround(", g.init.jsexpr, ")")
+          r.putln("var Gf", idx, " = fround(", g.init.jsexpr, ")")
           break
         case TYPES.F64:
-          r.putln("var G", idx, " = +", g.init.jsexpr)
+          r.putln("var Gd", idx, " = +", g.init.jsexpr)
           break
       }
     }
@@ -1003,7 +1002,7 @@ function renderAsmFuncFooter(r) {
   }
   r.hasRenderedAsmFuncFooter = true
 
-  // We return *all* the functions from the asmj module, so
+  // We return *all* the functions from the asmjs module, so
   // that we can put them into tables etc in the outer function.
   r.putln("return {")
   r.functions.forEach(function(f, idx) {
@@ -1021,6 +1020,34 @@ function renderOuterJSFooter(r) {
   renderAsmFuncCreation(r)
   renderAsmFuncHeader(r)
   renderAsmFuncFooter(r)
+  // Now that we're sure linking will succeed, initialize any tables.
+  r.elements.forEach(function(e) {
+    var pos = 0
+    var elems = []
+    for (var i = 0; i < e.elems.length; i++) {
+      elems.push("funcs.F" + e.elems[i])
+      if (elems.length >= 1024 || i === e.elems.length - 1) {
+        r.putln("T", e.table, "._setmany((", e.offset.jsexpr, ") + ", pos, ", [", elems.join(","), "])")
+        pos += elems.length
+        elems = []
+      }
+    }
+  })
+  // And any data segments.
+  r.datas.forEach(function(d) {
+    var bytes = []
+    var pos = 0
+    r.putln("var mb = new Uint8Array(M0.buffer)")
+    for (var i = 0; i < d.bytes.length; i++) {
+      bytes.push(d.bytes[i])
+      if (bytes.length >= 1024 || i === d.bytes.length - 1) {
+        r.putln("mb.set([", bytes.join(","), "], (", d.offset.jsexpr, ") + ", pos, ")")
+        pos += bytes.length
+        bytes = []
+      }
+    }
+  })
+  // Run the start function, if specified.
   if (r.start !== null) {
     r.putln("funcs.F", r.start, "()")
   }
@@ -1031,4 +1058,20 @@ function renderOuterJSFooter(r) {
     r.putln("return {}")
   }
   r.putln("})")
+}
+
+
+function typeToNameSuffix(typ) {
+  switch(typ) {
+    case TYPES.I32:
+      return "i"
+    case TYPES.I64:
+      return "l"
+    case TYPES.F32:
+      return "f"
+    case TYPES.F64:
+      return "d"
+    default:
+      throw new CompileError("unknown type: " + typ)
+  }
 }

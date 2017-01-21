@@ -2,9 +2,18 @@
 // Parse WASM binary format for function bodies into executable javascript.
 //
 
+import Long from "long"
 import stdlib from "../stdlib"
 import { CompileError } from "../errors"
-import { dump, stringifyJSValue, makeSigStr } from "../utils"
+import {
+  dump,
+  stringifyJSValue,
+  makeSigStr,
+  inherits,
+  isLittleEndian,
+  isNaNPreserving32,
+  isNaNPreserving64
+} from "../utils"
 import {
   PAGE_SIZE,
   TYPES,
@@ -27,31 +36,13 @@ function parseBlockType(s) {
 
 export default function translateFunctionCode(s, r, f) {
 
-  // XXX TODO: parse into an in-memory representation so we
-  // can do a bit of simplication etc before rendering the JS.
-  // It will be a good opportunity to merge bounds checks,
-  // eliminate needless preservation of NaN bits, etc.
-  //
-  // For now, we're just accumulating a list of strings to render.
+  var returnType = f.sig.return_types.length > 0 ? f.sig.return_types[0] : TYPES.NONE
 
-  f.bodyLines = []
-  f.pushLine = function pushLine(ln, indent) {
-    if (f.cfStack.isDeadCode()) {
-      f.bodyLines.push("trap('dead code')")
-      return
-    }
-    var indent = (f.cfStack.peek().index) + (indent || 0) + 1
-    while (indent > 0) {
-      ln = "  " + ln
-      indent--
-    }
-    f.bodyLines.push(ln)
-  }
-
+  var funcBody = new FunctionBody(returnType)
   f.cfStack = new ControlFlowStack()
-  f.cfStack.push(0, (f.sig.return_types.length > 0 ? f.sig.return_types[0] : TYPES.NONE))
+  f.cfStack.push(funcBody)
 
-  function getLocalType(index) {
+  f.getLocalTypeByIndex = function getLocalTypeByIndex(index) {
     var count = f.sig.param_types.length
     if (index < count) {
       return f.sig.param_types[index]
@@ -67,29 +58,12 @@ export default function translateFunctionCode(s, r, f) {
     throw new CompileError("local index too large: " + index)
   }
 
-  function getLocalVar(index, typ) {
-    typ = typ || getLocalType(index)
-    switch (typ) {
-      case TYPES.I32:
-        return "li" + index
-      case TYPES.I64:
-        return "ll" + index
-      case TYPES.F32:
-        return "lf" + index
-      case TYPES.F64:
-        return "ld" + index
-      default:
-        throw new CompileError("unexpected type of local")
-    }
-  }
-
   DECODE: while (true) {
     var op = s.read_byte()
     switch (op) {
 
       case OPCODES.UNREACHABLE:
-        f.pushLine("return trap('unreachable')")
-        f.cfStack.markDeadCode()
+        f.cfStack.addTerminalStatement(new Unreachable())
         break
 
       case OPCODES.NOP:
@@ -97,256 +71,93 @@ export default function translateFunctionCode(s, r, f) {
 
       case OPCODES.BLOCK:
         var sig = parseBlockType(s)
-        var cf = f.cfStack.push(op, sig)
-        f.pushLine(cf.label + ": do {", -1)
+        f.cfStack.push(new Block(sig))
         break
 
       case OPCODES.LOOP:
         var sig = parseBlockType(s)
-        var cf = f.cfStack.push(op, sig)
-        f.pushLine(cf.label + ": while (1) {", -1)
+        f.cfStack.push(new Loop(sig))
         break
 
       case OPCODES.IF:
         var sig = parseBlockType(s)
-        var cond = f.cfStack.popVar(TYPES.I32)
-        var cf = f.cfStack.push(op, sig)
-        f.pushLine(cf.label + ": do { if (" + cond + ") {", -1)
+        var cond = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.push(new IfElse(sig, cond))
         break
 
       case OPCODES.ELSE:
-        // XXX TODO: need to sanity-check that the `if` branch
-        // left precisely one value, of correct type, on the stack.
-        // The push/pop here resets stack state between the two branches.
-        var cf = f.cfStack.pop()
-        if (cf.op !== OPCODES.IF) {
-          throw new CompileError("ELSE outside of IF")
-        }
-        if (! cf.isDead) {
-          cf.endReached = true
-        }
-        f.pushLine("} else {")
-        f.cfStack.push(OPCODES.ELSE, cf.sig, cf.endReached)
+        f.cfStack.peek().switchToElseBranch()
         break
 
       case OPCODES.END:
-        var cf = f.cfStack.peek()
+        var cf = f.cfStack.pop()
         if (cf.index === 0) {
-          // End of the entire function.
-          if (f.sig.return_types.length === 0) {
-            if (cf.typeStack.length > 0) {
-              throw new CompileError("void function left something on the stack")
-            }
-            f.pushLine("return")
-          } else {
-            f.pushLine("return " + f.cfStack.popVar(f.sig.return_types[0]))
-          }
-          break DECODE
-        } else {
-          // End of a control block
-          if (! cf.isDead) {
-            cf.endReached = true
-          } else if (cf.endReached && cf.sig !== TYPES.NONE) {
-            // We're reached by a branch, but not by fall-through,
-            // so there's not going to be an entry on the stack.
-            // Make one.
-            f.cfStack.pushVar(cf.sig)
-          }
-          // An if without an else always reaches the end of the block.
-          if (cf.op === OPCODES.IF) {
-            cf.endReached = true
-          }
-          if (cf.endReached) {
-            if (cf.sig !== TYPES.NONE) {
-              var output = f.cfStack.getVar(cf.sig)
-            } else {
-              if (cf.typeStack.length > 0) {
-                throw new CompileError("void block left values on the stack")
-              }
-            }
-          }
-          f.cfStack.pop()
-          if (cf.sig !== TYPES.NONE && cf.endReached) {
-            var result = f.cfStack.pushVar(cf.sig)
-            if (result !== output) {
-              f.pushLine("  " + result + " = " + output)
-            }
-          }
-          switch (cf.op) {
-            case OPCODES.BLOCK:
-              f.pushLine("} while(0)")
-              break
-            case OPCODES.LOOP:
-              f.pushLine("  break " + cf.label)
-              f.pushLine("}")
-              break
-            case OPCODES.IF:
-            case OPCODES.ELSE:
-              f.pushLine("} } while (0)")
-              break
-            default:
-              throw new CompileError("Popped an unexpected control op")
-          }
-          if (! cf.endReached) {
-            f.cfStack.markDeadCode()
-          }
+          break DECODE // End of the entire function body.
         }
         break
 
       case OPCODES.BR:
         var depth = s.read_varuint32()
         var cf = f.cfStack.getBranchTarget(depth)
-        switch (cf.op) {
-          case OPCODES.BLOCK:
-          case OPCODES.IF:
-          case OPCODES.ELSE:
-            cf.endReached = true
-            if (cf.sig !== TYPES.NONE) {
-              var resultVar = f.cfStack.popVar(cf.sig)
-              var outputVar = f.cfStack.getBlockOutputVar(depth)
-              if (outputVar !== resultVar) {
-                f.pushLine(outputVar + " = " + resultVar)
-              }
-            }
-            f.pushLine("break " + cf.label)
-            break
-          case 0:
-            cf.endReached = true
-            if (cf.sig !== TYPES.NONE) {
-              var resultVar = f.cfStack.popVar(cf.sig)
-              f.pushLine("return " + resultVar)
-            } else {
-              f.pushLine("return")
-            }
-            break
-          case OPCODES.LOOP:
-            f.pushLine("continue " + cf.label)
-            break
-          default:
-            throw new CompileError("Branch to unsupported opcode")
+        if (cf.branchResultType === TYPES.NONE) {
+          f.cfStack.addTerminalStatement(new Branch(cf))
+        } else {
+          var result = f.cfStack.popValue(cf.branchResultType)
+          f.cfStack.addTerminalStatement(new Branch(cf, result))
         }
-        f.cfStack.markDeadCode()
         break
 
       case OPCODES.BR_IF:
         var depth = s.read_varuint32()
         var cf = f.cfStack.getBranchTarget(depth)
-        switch (cf.op) {
-          case OPCODES.BLOCK:
-          case OPCODES.IF:
-          case OPCODES.ELSE:
-            cf.endReached = true
-            f.pushLine("if (" + f.cfStack.popVar(TYPES.I32) + ") {")
-            if (cf.sig !== TYPES.NONE) {
-              // This is left on the stack if condition is not true.
-              // XXX TODO this needs to check what's on the stack.
-              var resultVar = f.cfStack.getVar(cf.sig)
-              var outputVar = f.cfStack.getBlockOutputVar(depth)
-              if (outputVar !== resultVar) {
-                f.pushLine("  " + outputVar + " = " + resultVar)
-              }
-            }
-            f.pushLine("  break " + cf.label)
-            f.pushLine("}")
-            break
-          case 0:
-            cf.endReached = true
-            f.pushLine("if (" + f.cfStack.popVar(TYPES.I32) + ") {")
-            if (cf.sig !== TYPES.NONE) {
-              var resultVar = f.cfStack.getVar(cf.sig)
-              f.pushLine("return " + resultVar)
-            } else {
-              f.pushLine("return")
-            }
-            f.pushLine("}")
-            break
-          case OPCODES.LOOP:
-            f.pushLine("if (" + f.cfStack.popVar(TYPES.I32) + ") { continue " + cf.label + " }")
-            break
-          default:
-            throw new CompileError("Branch to unsupported opcode")
+        var cond = f.cfStack.popValue(TYPES.I32)
+        if (cf.branchResultType === TYPES.NONE) {
+          f.cfStack.addStatement(new BranchIf(cond, cf))
+        } else {
+          // If the condition is false, we have to leave the
+          // value on the stack.  Spill it to keep this simple
+          // and avoid duplicating large expressions.
+          f.cfStack.spillValueIfComposite()
+          var result = f.cfStack.peekValue(cf.branchResultType)
+          f.cfStack.addStatement(new BranchIf(cond, cf, result))
         }
         break
 
       case OPCODES.BR_TABLE:
-        // Terribly inefficient implementation of br_table
-        // using a big ol' switch statement.  I don't think
-        // there's anything better we can do though.
+        // Not-super-efficient implementation of br_table using
+        // a big ol' switch statement.  I don't think there's
+        // anything better we can do though...
         var count = s.read_varuint32()
-        var targets = []
+        var target_cfs = []
         while (count > 0) {
-          targets.push(s.read_varuint32())
+          var depth = s.read_varuint32()
+          target_cfs.push(f.cfStack.getBranchTarget(depth))
           count--
         }
-        var default_target = s.read_varuint32()
-        var default_cf = f.cfStack.getBranchTarget(default_target)
-        f.pushLine("switch(" + f.cfStack.popVar(TYPES.I32) + ") {")
-        // XXX TODO: typechecking that all targets accept the
-        // same result type etc.
-        var resultVar = null;
-        if (default_cf.sig !== TYPES.NONE) {
-          resultVar = f.cfStack.popVar(default_cf.sig)
-        }
-        targets.forEach(function(target, targetNum) {
-          f.pushLine("  case " + targetNum + ":")
-          var cf = f.cfStack.getBranchTarget(target)
-          cf.endReached = true
-          if (cf.sig !== TYPES.NONE) {
-            var outputVar = f.cfStack.getBlockOutputVar(target)
-            if (outputVar !== resultVar) {
-              f.pushLine("    " + outputVar + " = " + resultVar)
-            }
-          }
-          switch (cf.op) {
-            case OPCODES.BLOCK:
-            case OPCODES.IF:
-            case OPCODES.ELSE:
-              f.pushLine("    break " + cf.label)
-              break
-            case OPCODES.LOOP:
-              f.pushLine("    continue " + cf.label)
-              break
-            case 0:
-              f.pushLine("    return " + outputVar)
-              break
-            default:
-              throw new CompileError("unknown branch target type")
+        var depth = s.read_varuint32()
+        var default_cf = f.cfStack.getBranchTarget(depth)
+        target_cfs.forEach(function(cf) {
+          if (cf.branchResultType !== default_cf.branchResultType) {
+            throw new CompileError("br_table result type mis-match")
           }
         })
-        f.pushLine("  default:")
-        if (default_cf.sig !== TYPES.NONE) {
-          var outputVar = f.cfStack.getBlockOutputVar(default_target)
-          if (outputVar !== resultVar) {
-            f.pushLine("    " + outputVar + " = " + resultVar)
-          }
+        var expr = f.cfStack.popValue(TYPES.I32)
+        if (default_cf.branchResultType === TYPES.NONE) {
+          f.cfStack.addTerminalStatement(new BranchTable(expr, default_cf, target_cfs))
+        } else {
+          var result = f.cfStack.popValue(default_cf.branchResultType)
+          f.cfStack.addTerminalStatement(new BranchTable(expr, default_cf, target_cfs, result))
         }
-        default_cf.endReached = true
-        switch (default_cf.op) {
-          case OPCODES.BLOCK:
-          case OPCODES.IF:
-          case OPCODES.ELSE:
-            f.pushLine("    break " + default_cf.label)
-            break
-          case OPCODES.LOOP:
-            f.pushLine("    continue " + default_cf.label)
-            break
-          case 0:
-            f.pushLine("    return " + outputVar)
-            break
-          default:
-            throw new CompileError("unknown branch target type")
-        }
-        f.pushLine("}")
-        f.cfStack.markDeadCode()
         break
 
       case OPCODES.RETURN:
-        if (f.sig.return_types.length === 0) {
-          f.pushLine("return")
+        var cf = f.cfStack.peekBottom()
+        if (cf.branchResultType === TYPES.NONE) {
+          f.cfStack.addTerminalStatement(new Branch(cf))
         } else {
-          f.pushLine("return " + f.cfStack.popVar(f.sig.return_types[0]))
+          var result = f.cfStack.popValue(cf.branchResultType)
+          f.cfStack.addTerminalStatement(new Branch(cf, result))
         }
-        f.cfStack.markDeadCode()
         break
 
       case OPCODES.CALL:
@@ -356,586 +167,427 @@ export default function translateFunctionCode(s, r, f) {
         // so we have to pop them in reverse.
         var args = new Array(callSig.param_types.length)
         for (var i = callSig.param_types.length - 1; i >= 0; i--) {
-          args[i] = f.cfStack.popVar(callSig.param_types[i])
+          args[i] = f.cfStack.popValue(callSig.param_types[i])
         }
-        var call = "F" + index + "(" + args.join(",") + ")"
+        // The call might have side-effects, so spill anything
+        // remaining on the stack.  XXX TODO: only spill affected values.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
         if (callSig.return_types.length === 0) {
-          f.pushLine(call)
+          f.cfStack.addStatement(new Drop(new Call(callSig, index, args)))
         } else {
-          // We know there's at most one return type, for now.
-          switch (callSig.return_types[0]) {
-            case TYPES.I32:
-              call = call + "|0"
-              break
-            /* These break our NaN boxing...
-            case TYPES.F32:
-              call = "ToF32(" + call + ")"
-              break
-            case TYPES.F64:
-              call = "+" + call
-              break*/
-          }
-          var output = f.cfStack.pushVar(callSig.return_types[0])
-          f.pushLine(output + " = " + call)
+          f.cfStack.pushValue(new Call(callSig, index, args))
+          // Force immediate execution, for side-effects.
+          // XXX TODO: this shouldn't be necessary; find the bug in our logic!
+          f.cfStack.spillValue()
         }
         break
 
       case OPCODES.CALL_INDIRECT:
         var type_index = s.read_varuint32()
         var table_index = s.read_varuint1()
-        if (table_index !== 0) {
-          throw new CompileError("MVP reserved-value constraint violation")
-        }
         r.getTableTypeByIndex(table_index)
         var callSig = r.getTypeSignatureByIndex(type_index)
-        var callIdx = f.cfStack.popVar(TYPES.I32)
+        var callIdx = f.cfStack.popValue(TYPES.I32)
         // The rightmost arg is the one on top of stack,
         // so we have to pop them in reverse.
-        var args = new Array(callSig.param_types.length + 1)
-        args[0] = callIdx
+        var args = new Array(callSig.param_types.length)
         for (var i = callSig.param_types.length - 1; i >= 0; i--) {
-          args[i + 1] = f.cfStack.popVar(callSig.param_types[i])
+          args[i] = f.cfStack.popValue(callSig.param_types[i])
         }
-        // XXX TODO: in some cases we could use asmjs type-specific function tables here.
-        // For now we just delegate to an externally-defined helper.
-        var call = "call_" + makeSigStr(callSig) + "(" + args.join(",") + ")"
+        // The call might have side-effects, so spill anything
+        // remaining on the stack.  XXX TODO: only spill affected values.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
         if (callSig.return_types.length === 0) {
-          f.pushLine(call)
+          f.cfStack.addStatement(new Drop(new CallIndirect(callSig, callIdx, args)))
         } else {
-          // We know there's at most one return type, for now.
-          switch (callSig.return_types[0]) {
-            case TYPES.I32:
-              call = call + "|0"
-              break
-            /* These break our NaN boxing...
-            case TYPES.F32:
-              call = "ToF32(" + call + ")"
-              break
-            case TYPES.F64:
-              call = "+" + call
-              break*/
-          }
-          var output = f.cfStack.pushVar(callSig.return_types[0])
-          f.pushLine(output + " = " + call)
+          f.cfStack.pushValue(new CallIndirect(callSig, callIdx, args))
+          // Force immediate execution, for side-effects.
+          // XXX TODO: this shouldn't be necessary; find the bug in our logic!
+          f.cfStack.spillValue()
         }
         break
 
       case OPCODES.DROP:
-        f.cfStack.popVar(TYPES.UNKNOWN)
+        // We use an explicit Drop statement in order to force
+        // evaluation of any calls or side-effects in the expression.
+        var expr = f.cfStack.popValue(TYPES.UNKNOWN)
+        f.cfStack.addStatement(new Drop(expr))
         break
 
       case OPCODES.SELECT:
-        var condVar = f.cfStack.popVar(TYPES.I32)
+        var cond = f.cfStack.popValue(TYPES.I32)
         var typ = f.cfStack.peekType()
-        var falseVar = f.cfStack.popVar(typ)
-        var trueVar = f.cfStack.popVar(typ)
-        f.cfStack.pushVar(typ)
-        var outputVar = f.cfStack.getVar(typ)
-        f.pushLine(outputVar + " = " + condVar + " ? " + trueVar + ":" + falseVar)
+        var falseExpr = f.cfStack.popValue(typ)
+        var trueExpr = f.cfStack.popValue(typ)
+        f.cfStack.pushValue(new Select(cond, trueExpr, falseExpr))
         break
 
       case OPCODES.GET_LOCAL:
         var index = s.read_varuint32()
-        var typ = getLocalType(index)
-        f.cfStack.pushVar(typ)
-        f.pushLine(f.cfStack.getVar(typ) + " = " + getLocalVar(index))
+        f.cfStack.pushValue(new GetLocal(f.getLocalTypeByIndex(index), index))
         break
 
       case OPCODES.SET_LOCAL:
         var index = s.read_varuint32()
-        f.pushLine(getLocalVar(index) + " = " + f.cfStack.popVar(getLocalType(index)))
+        var typ = f.getLocalTypeByIndex(index)
+        var expr = f.cfStack.popValue(typ)
+        // XXX TODO: only spill values that might be affected by the assignment.
+        f.cfStack.spillAllValues()
+        f.cfStack.addStatement(new SetLocal(typ, index, expr))
         break
 
       case OPCODES.TEE_LOCAL:
         var index = s.read_varuint32()
-        var typ = getLocalType(index)
-        f.pushLine(getLocalVar(index) + " = " + f.cfStack.popVar(typ))
-        f.cfStack.pushVar(typ) // this var will already contain the value we just set
+        var typ = f.getLocalTypeByIndex(index)
+        var expr = f.cfStack.popValue(typ)
+        // XXX TODO: only spill values that might be affected by the assignment.
+        f.cfStack.spillAllValues()
+        f.cfStack.addStatement(new SetLocal(typ, index, expr))
+        f.cfStack.pushValue(new GetLocal(typ, index))
         break
 
       case OPCODES.GET_GLOBAL:
         var index = s.read_varuint32()
         var typ = r.getGlobalTypeByIndex(index)
-        f.cfStack.pushVar(typ)
-        f.pushLine(f.cfStack.getVar(typ) + " = G" + index)
+        f.cfStack.pushValue(new GetGlobal(typ, index))
         break
 
       case OPCODES.SET_GLOBAL:
         var index = s.read_varuint32()
-        var typ = r.getGlobalTypeByIndex(index)
         if (! r.getGlobalMutabilityByIndex(index)) {
           throw new CompileError("global is immutable: " + index)
         }
-        f.pushLine("G" + index + " = " + f.cfStack.popVar(typ))
+        var typ = r.getGlobalTypeByIndex(index)
+        var expr = f.cfStack.popValue(typ)
+        // XXX TODO: only spill values that might be affected by the assignment.
+        f.cfStack.spillAllValues()
+        f.cfStack.addStatement(new SetGlobal(typ, index, expr))
         break
 
       case OPCODES.I32_LOAD:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_load_unaligned(f, addr, offset)
-            break
-          case 2:
-            i32_load_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        f.cfStack.pushValue(new I32Load(addr, offset, flags))
         break
 
       case OPCODES.I64_LOAD:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        // Need two i32 vars, so create a temp one.
-        f.cfStack.pushVar(TYPES.I32)
-        var addrDup = f.cfStack.popVar(TYPES.I32)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        f.pushLine(addrDup + " = " + addr)
-        boundsCheck(f, addr, offset, 8)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_load_unaligned(f, addr, offset)
-            i32_load_unaligned(f, addrDup, offset + 4)
-            break
-          case 2:
-          case 3:
-            i32_load_aligned(f, addr, offset)
-            i32_load_aligned(f, addrDup, offset + 4)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
-        i64_from_i32x2(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 8)
+        if (flags === 3) { flags = 2 }
+        f.cfStack.pushValue(new I32Load(addr, offset, flags))
+        f.cfStack.pushValue(new I32Load(addr, offset + 4, flags))
+        f.cfStack.pushValue(new I64From2xI32(
+          f.cfStack.popValue(TYPES.I32),
+          f.cfStack.popValue(TYPES.I32)
+        ))
         break
 
       case OPCODES.F32_LOAD:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-          case 1:
-            f32_load_unaligned(f, addr, offset)
-            break
-          case 2:
-            f32_load_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        f.cfStack.pushValue(new F32Load(addr, offset, flags))
         break
 
       case OPCODES.F64_LOAD:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 8)
-        switch (flags) {
-          case 0:
-          case 1:
-          case 2:
-            f64_load_unaligned(f, addr, offset)
-            break
-          case 3:
-            f64_load_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags: " + flags)
-        }
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 8)
+        f.cfStack.pushValue(new F64Load(addr, offset, flags))
         break
 
       case OPCODES.I32_LOAD8_S:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_load8_s(f, addr, offset)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        f.cfStack.pushValue(new I32Load8S(addr, offset, flags))
         break
 
       case OPCODES.I32_LOAD8_U:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_load8_u(f, addr, offset)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        f.cfStack.pushValue(new I32Load8U(addr, offset, flags))
         break
 
       case OPCODES.I32_LOAD16_S:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_load16_s_unaligned(f, addr, offset)
-            break
-          case 1:
-            i32_load16_s_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        f.cfStack.pushValue(new I32Load16S(addr, offset, flags))
         break
 
       case OPCODES.I32_LOAD16_U:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_load16_u_unaligned(f, addr, offset)
-            break
-          case 1:
-            i32_load16_u_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        f.cfStack.pushValue(new I32Load16U(addr, offset, flags))
         break
 
       case OPCODES.I64_LOAD8_S:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_load8_s(f, addr, offset)
-        i64_from_i32_s(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        f.cfStack.pushValue(new I32Load8S(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32S(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I64_LOAD8_U:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_load8_u(f, addr, offset)
-        i64_from_i32_u(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        f.cfStack.pushValue(new I32Load8U(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32U(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I64_LOAD16_S:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_load16_s_unaligned(f, addr, offset)
-            break
-          case 1:
-            i32_load16_s_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
-        i64_from_i32_s(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        f.cfStack.pushValue(new I32Load16S(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32S(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I64_LOAD16_U:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_load16_u_unaligned(f, addr, offset)
-            break
-          case 1:
-            i32_load16_u_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
-        i64_from_i32_u(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        f.cfStack.pushValue(new I32Load16U(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32U(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I64_LOAD32_S:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_load_unaligned(f, addr, offset)
-            break
-          case 2:
-            i32_load_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
-        i64_from_i32_s(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        f.cfStack.pushValue(new I32Load(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32S(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I64_LOAD32_U:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_load_unaligned(f, addr, offset)
-          case 2:
-            i32_load_aligned(f, addr, offset)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
-        i64_from_i32_u(f)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        f.cfStack.pushValue(new I32Load(addr, offset, flags))
+        f.cfStack.pushValue(new I64FromI32U(f.cfStack.popValue(TYPES.I32)))
         break
 
       case OPCODES.I32_STORE:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I32)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_store_unaligned(f, addr, offset, value)
-            break
-          case 2:
-            i32_store_aligned(f, addr, offset, value)
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        var value = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        f.cfStack.addStatement(new I32Store(value, addr, offset, flags))
         break
 
       case OPCODES.I64_STORE:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I64)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 8)
-        switch (flags) {
-          case 0:
-          case 1:
-            i32_store_unaligned(f, addr, offset, value + ".low")
-            i32_store_unaligned(f, addr, offset + 4, value + ".high")
-            break
-          case 2:
-          case 3:
-            i32_store_aligned(f, addr, offset, value + ".low")
-            i32_store_aligned(f, addr, offset + 4, value + ".high")
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        f.cfStack.spillValueIfComposite()
+        var value = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 8)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        if (flags === 3) { flags = 2 }
+        f.cfStack.addStatement(new I32Store(new I32FromI64Low(value), addr, offset, flags))
+        f.cfStack.addStatement(new I32Store(new I32FromI64High(value), addr, offset + 4, flags))
         break
 
       case OPCODES.F32_STORE:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.F32)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 8)
-        switch (flags) {
-          case 0:
-          case 1:
-            f32_store_unaligned(f, addr, offset, value)
-            break
-          case 2:
-            f32_store_aligned(f, addr, offset, value)
-            break
-          default:
-            throw new CompileError("unsupported load flags: " + flags)
-        }
+        var value = f.cfStack.popValue(TYPES.F32)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        f.cfStack.addStatement(new F32Store(value, addr, offset, flags))
         break
 
       case OPCODES.F64_STORE:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.F64)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 8)
-        switch (flags) {
-          case 0:
-          case 1:
-          case 2:
-            f64_store_unaligned(f, addr, offset, value)
-            break
-          case 3:
-            f64_store_aligned(f, addr, offset, value)
-            break
-          default:
-            throw new CompileError("unsupported load flags: " + flags)
-        }
+        var value = f.cfStack.popValue(TYPES.F64)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 8)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        f.cfStack.addStatement(new F64Store(value, addr, offset, flags))
         break
 
       case OPCODES.I32_STORE8:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I32)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_store8(f, addr, offset, value + " & 0xFF")
+        var value = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        f.cfStack.addStatement(new I32Store8(value, addr, offset, flags))
         break
 
       case OPCODES.I32_STORE16:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I32)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_store8(f, addr, offset + 0, "(" + value + " & 0x00FF) >>> 0")
-            i32_store8(f, addr, offset + 1, "(" + value + " & 0xFF00) >>> 8")
-            break
-          case 1:
-            i32_store16(f, addr, offset, "(" + value + " & 0xFFFF) >>> 0")
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        var value = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        f.cfStack.addStatement(new I32Store16(value, addr, offset, flags))
         break
 
       case OPCODES.I64_STORE8:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
-        if (flags > 0) {
-          throw new CompileError("alignment larger than natural")
-        }
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I64)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 1)
-        i32_store8(f, addr, offset, "(" + value + ".low) & 0xFF")
+        var value = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 1)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        value = new I32FromI64Low(value)
+        f.cfStack.addStatement(new I32Store8(value, addr, offset, flags))
         break
 
       case OPCODES.I64_STORE16:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I64)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 2)
-        switch (flags) {
-          case 0:
-            i32_store8(f, addr, offset + 0, "((" + value + ".low) & 0x00FF) >>> 0")
-            i32_store8(f, addr, offset + 1, "((" + value + ".low) & 0xFF00) >>> 8")
-            break
-          case 1:
-            i32_store16(f, addr, offset, "((" + value + ".low) & 0xFFFF) >>> 0")
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        var value = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 2)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        value = new I32FromI64Low(value)
+        f.cfStack.addStatement(new I32Store16(value, addr, offset, flags))
         break
 
       case OPCODES.I64_STORE32:
         r.getMemoryTypeByIndex(0)
         var flags = s.read_varuint32()
         var offset = s.read_varuint32()
-        var value = f.cfStack.popVar(TYPES.I64)
-        var addr = f.cfStack.popVar(TYPES.I32)
-        boundsCheck(f, addr, offset, 4)
-        switch (flags) {
-          case 0:
-            i32_store8(f, addr, offset + 0, "((" + value + ".low) & 0x000000FF) >>> 0")
-            i32_store8(f, addr, offset + 1, "((" + value + ".low) & 0x0000FF00) >>> 8")
-            i32_store8(f, addr, offset + 2, "((" + value + ".low) & 0x00FF0000) >>> 16")
-            i32_store8(f, addr, offset + 3, "((" + value + ".low) & 0xFF000000) >>> 24")
-            break
-          case 1:
-            i32_store16(f, addr, offset + 0, "((" + value + ".low) & 0x0000FFFF) >>> 0")
-            i32_store16(f, addr, offset + 2, "((" + value + ".low) & 0xFFFF0000) >>> 16")
-            break
-          case 2:
-            i32_store_aligned(f, addr, offset, "(" + value + ".low)")
-            break
-          default:
-            throw new CompileError("unsupported load flags")
-        }
+        var value = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var addr = f.cfStack.popValue(TYPES.I32)
+        addBoundsCheckTrapCondition(f, addr, offset, 4)
+        // XXX TODO: spill only things affected by memory writes.
+        f.cfStack.spillAllValues()
+        f.cfStack.finalizeTrapConditions()
+        value = new I32FromI64Low(value)
+        f.cfStack.addStatement(new I32Store(value, addr, offset, flags))
         break
 
       case OPCODES.CURRENT_MEMORY:
-        var mem_index = s.read_varuint1()
-        if (mem_index !== 0) {
-          throw new CompileError("only one memory in the MVP")
-        }
-        r.getMemoryTypeByIndex(mem_index)
-        f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = (memorySize / " + PAGE_SIZE + ")|0")
+        var index = s.read_varuint1()
+        r.getMemoryTypeByIndex(index)
+        f.cfStack.pushValue(new GetMemorySize(index))
         break
 
       case OPCODES.GROW_MEMORY:
-        var mem_index = s.read_varuint1()
-        if (mem_index !== 0) {
-          throw new CompileError("only one memory in the MVP")
-        }
-        r.getMemoryTypeByIndex(mem_index)
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var res = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine(res + " = M0._grow(" + operand + ")")
+        f.cfStack.finalizeTrapConditions()
+        var index = s.read_varuint1()
+        r.getMemoryTypeByIndex(index)
+        var expr = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new GrowMemory(index, expr))
+        f.cfStack.spillValue() // force immediate evaluation, because side-effects.
         break
 
       case OPCODES.I32_CONST:
         var val = s.read_varint32()
-        f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = " + stringifyJSValue(val))
+        f.cfStack.pushValue(new I32Constant(val))
         break
 
       case OPCODES.I64_CONST:
         var val = s.read_varint64()
-        f.pushLine(f.cfStack.pushVar(TYPES.I64) + " = " + stringifyJSValue(val))
+        f.cfStack.pushValue(new I64Constant(val))
         break
 
       case OPCODES.F32_CONST:
         var val = s.read_float32()
-        f.pushLine(f.cfStack.pushVar(TYPES.F32) + " = " + stringifyJSValue(val))
+        f.cfStack.pushValue(new F32Constant(val))
         break
 
       case OPCODES.F64_CONST:
         var val = s.read_float64()
-        f.pushLine(f.cfStack.pushVar(TYPES.F64) + " = " + stringifyJSValue(val))
+        f.cfStack.pushValue(new F64Constant(val))
         break
 
       case OPCODES.I32_EQZ:
-        var operand = f.cfStack.getVar(TYPES.I32)
-        f.pushLine(operand + " = (!(" + operand + "))|0")
+        var expr = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new I32Eqz(expr))
         break
 
       case OPCODES.I32_EQ:
@@ -951,7 +603,7 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_LT_U:
-        i32_binaryOp(f, "<", ">>>0")
+        i32_binaryOp_u(f, "<")
         break
 
       case OPCODES.I32_GT_S:
@@ -959,7 +611,7 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_GT_U:
-        i32_binaryOp(f, ">", ">>>0")
+        i32_binaryOp_u(f, ">")
         break
 
       case OPCODES.I32_LE_S:
@@ -967,7 +619,7 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_LE_U:
-        i32_binaryOp(f, "<=", ">>>0")
+        i32_binaryOp_u(f, "<=")
         break
 
       case OPCODES.I32_GE_S:
@@ -975,13 +627,12 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_GE_U:
-        i32_binaryOp(f, ">=", ">>>0")
+        i32_binaryOp_u(f, ">=")
         break
 
       case OPCODES.I64_EQZ:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var result = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine(result + " = (" + operand + ".isZero())|0")
+        var expr = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new I64Eqz(expr))
         break
 
       case OPCODES.I64_EQ:
@@ -1097,32 +748,35 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_DIV_S:
-        var rhs = f.cfStack.getVar(TYPES.I32)
-        var lhs = f.cfStack.getVar(TYPES.I32, 1)
-        f.pushLine("if (" + rhs + " == 0) { return trap('i32_div_s') }")
-        f.pushLine("if (" + lhs + " == INT32_MIN && " + rhs + " == -1) { return trap('i32_div_s') }")
+        // Spill both sides to tempvars, so we can add trap conditions.
+        var rhs = f.cfStack.popValue(TYPES.I32)
+        var lhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.pushValue(rhs)
+        rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I32Eqz(rhs))
+        f.cfStack.addTrapCondition(new I32BinOp('&', 
+          new I32BinOp('==', lhs, new I32Constant(stdlib.INT32_MIN)),
+          new I32BinOp('==', rhs, new I32Constant(-1))
+        ))
         i32_binaryOp(f, "/")
         break
 
       case OPCODES.I32_DIV_U:
-        var rhs = f.cfStack.getVar(TYPES.I32)
-        var lhs = f.cfStack.getVar(TYPES.I32, 1)
-        f.pushLine("if (" + rhs + " == 0) { return trap('i32_div_u') }")
-        i32_binaryOp(f, "/", ">>>0")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I32Eqz(rhs))
+        i32_binaryOp_u(f, "/")
         break
 
       case OPCODES.I32_REM_S:
-        var rhs = f.cfStack.getVar(TYPES.I32)
-        f.pushLine("if (" + rhs + " == 0) { return trap('i32_rem_s') }")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I32Eqz(rhs))
         i32_binaryOp(f, "%")
         break
 
       case OPCODES.I32_REM_U:
-        var rhs = f.cfStack.getVar(TYPES.I32)
-        f.pushLine("if (" + rhs + " == 0) { return trap('i32_rem_u') }")
-        i32_binaryOp(f, "%", ">>>0")
-        var res = f.cfStack.getVar(TYPES.I32)
-        f.pushLine(res + " = " + res + "|0")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I32Eqz(rhs))
+        i32_binaryOp_u(f, "%")
         break
 
       case OPCODES.I32_AND:
@@ -1182,28 +836,34 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I64_DIV_S:
-        var rhs = f.cfStack.getVar(TYPES.I64)
-        var lhs = f.cfStack.getVar(TYPES.I64, 1)
-        f.pushLine("if (" + rhs + ".isZero()) { return trap('i64_div_s') }")
-        f.pushLine("if (" + lhs + ".eq(Long.MIN_VALUE) && " + rhs + ".eq(Long.NEG_ONE)) { return trap('i64_div_s') }")
+        // Spill both sides to tempvars, so we can add trap conditions.
+        var rhs = f.cfStack.popValue(TYPES.I64)
+        var lhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.pushValue(rhs)
+        rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I64Eqz(rhs))
+        f.cfStack.addTrapCondition(new I32BinOp('&', 
+          new I64CompareFunc('i64_eq', lhs, new I64Constant(Long.MIN_VALUE)),
+          new I64CompareFunc('i64_eq', rhs, new I64Constant(Long.NEG_ONE))
+        ))
         i64_binaryFunc(f, "i64_div_s")
         break
 
       case OPCODES.I64_DIV_U:
-        var rhs = f.cfStack.getVar(TYPES.I64)
-        f.pushLine("if (" + rhs + ".isZero()) { return trap('i64_div_u') }")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I64Eqz(rhs))
         i64_binaryFunc(f, "i64_div_u")
         break
 
       case OPCODES.I64_REM_S:
-        var rhs = f.cfStack.getVar(TYPES.I64)
-        f.pushLine("if (" + rhs + ".isZero()) { return trap('i64_rem_s') }")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I64Eqz(rhs))
         i64_binaryFunc(f, "i64_rem_s")
         break
 
       case OPCODES.I64_REM_U:
-        var rhs = f.cfStack.getVar(TYPES.I64)
-        f.pushLine("if (" + rhs + ".isZero()) { return trap('i64_rem_u') }")
+        var rhs = f.cfStack.spillValueIfComposite()
+        f.cfStack.addTrapCondition(new I64Eqz(rhs))
         i64_binaryFunc(f, "i64_rem_u")
         break
 
@@ -1352,185 +1012,168 @@ export default function translateFunctionCode(s, r, f) {
         break
 
       case OPCODES.I32_WRAP_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine(output + " = " + operand + ".low")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new I32FromI64Low(operand))
         break
 
       case OPCODES.I32_TRUNC_S_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine("if (" + operand + " > INT32_MAX) { return trap('i32_trunc_s') }")
-        f.pushLine("if (" + operand + " < INT32_MIN) { return trap('i32_trunc_s') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap() }")
-        f.pushLine(output + " = (" + operand + ")|0")
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F32)
+        f.cfStack.addTrapCondition(new F32CompareOp('>=', operand, new F32Constant(stdlib.INT32_MAX)))
+        f.cfStack.addTrapCondition(new F32CompareOp('<', operand, new F32Constant(stdlib.INT32_MIN)))
+        f.cfStack.addTrapCondition(new F32IsNaN(operand))
+        f.cfStack.pushValue(new I32TruncF32S(operand))
         break
 
       case OPCODES.I32_TRUNC_S_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine("if (" + operand + " > INT32_MAX) { return trap('i32_trunc_s') }")
-        f.pushLine("if (" + operand + " < INT32_MIN) { return trap('i32_trunc_s') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc_s') }")
-        f.pushLine(output + " = (" + operand + ")|0")
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F64)
+        f.cfStack.addTrapCondition(new F64CompareOp('>', operand, new F32Constant(stdlib.INT32_MAX)))
+        f.cfStack.addTrapCondition(new F64CompareOp('<', operand, new F32Constant(stdlib.INT32_MIN)))
+        f.cfStack.addTrapCondition(new F64IsNaN(operand))
+        f.cfStack.pushValue(new I32TruncF64S(operand))
         break
 
       case OPCODES.I32_TRUNC_U_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine("if (" + operand + " > UINT32_MAX) { return trap('i32_trunc') }")
-        f.pushLine("if (" + operand + " <= -1) { return trap('i32_trunc') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc') }")
-        f.pushLine(output + " = ((" + operand + ")>>>0)|0")
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F32)
+        f.cfStack.addTrapCondition(new F32CompareOp('>=', operand, new F32Constant(stdlib.UINT32_MAX)))
+        f.cfStack.addTrapCondition(new F32CompareOp('<=', operand, new F32Constant(-1)))
+        f.cfStack.addTrapCondition(new F32IsNaN(operand))
+        f.cfStack.pushValue(new I32TruncF32U(operand))
         break
 
       case OPCODES.I32_TRUNC_U_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine("if (" + operand + " > UINT32_MAX) { return trap('i32_trunc') }")
-        f.pushLine("if (" + operand + " <= -1) { return trap('i32_trunc') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i32_trunc') }")
-        f.pushLine(output + " = (" + operand + ")>>>0")
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F64)
+        f.cfStack.addTrapCondition(new F64CompareOp('>', operand, new F64Constant(stdlib.UINT32_MAX)))
+        f.cfStack.addTrapCondition(new F64CompareOp('<=', operand, new F64Constant(-1)))
+        f.cfStack.addTrapCondition(new F64IsNaN(operand))
+        f.cfStack.pushValue(new I32TruncF32U(operand))
         break
 
       case OPCODES.I64_EXTEND_S_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.I64)
-        f.pushLine(output + " = Long.fromNumber(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new I64FromI32S(operand))
         break
 
       case OPCODES.I64_EXTEND_U_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.I64)
-        f.pushLine(output + " = Long.fromNumber(" + operand + ">>>0, true).toSigned()")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new I64FromI32U(operand))
         break
 
       case OPCODES.I64_TRUNC_S_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F32)
         // XXX TODO: I actually don't understand floating-point much at all,
         //           right now am just hacking the tests into passing...
-        f.pushLine("if (" + operand + " >= 9.22337203685e+18) { return trap('i64-trunc') }")
-        f.pushLine("if (" + operand + " <= -9.22337313636e+18) { return trap('i64-trunc') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
-        f.pushLine(output + " = Long.fromNumber(" + operand + ")")
+        f.cfStack.addTrapCondition(new F32CompareOp('>=', operand, new F32Constant(9.22337203685e+18)))
+        f.cfStack.addTrapCondition(new F32CompareOp('<=', operand, new F32Constant(-9.22337313636e+18)))
+        f.cfStack.addTrapCondition(new F32IsNaN(operand))
+        f.cfStack.pushValue(new I64TruncF32S(operand))
         break
 
       case OPCODES.I64_TRUNC_S_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F64)
         // XXX TODO: I actually don't understand floating-point much at all,
         //           right now am just hacking the tests into passing...
-        f.pushLine("if (" + operand + " >= 9223372036854775808.0) { return trap('i64-trunc') }")
-        f.pushLine("if (" + operand + " <= -9223372036854777856.0) { return trap('i64-trunc') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
-        f.pushLine(output + " = Long.fromNumber(" + operand + ")")
+        f.cfStack.addTrapCondition(new F64CompareOp('>=', operand, new F64Constant(9223372036854775808.0)))
+        f.cfStack.addTrapCondition(new F64CompareOp('<=', operand, new F64Constant(-9223372036854777856.0)))
+        f.cfStack.addTrapCondition(new F64IsNaN(operand))
+        f.cfStack.pushValue(new I64TruncF64S(operand))
         break
 
       case OPCODES.I64_TRUNC_U_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F32)
         // XXX TODO: I actually don't understand floating-point much at all,
         //           right now am just hacking the tests into passing...
-        f.pushLine("if (" + operand + " >= 1.84467440737e+19) { return trap('i64-trunc') }")
-        f.pushLine("if (" + operand + " <= -1) { return trap('i64-trunc') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('i64-trunc') }")
-        f.pushLine(output + " = Long.fromNumber(" + operand + ", true).toSigned()")
+        f.cfStack.addTrapCondition(new F32CompareOp('>=', operand, new F32Constant(1.84467440737e+19)))
+        f.cfStack.addTrapCondition(new F32CompareOp('<=', operand, new F32Constant(-1)))
+        f.cfStack.addTrapCondition(new F32IsNaN(operand))
+        f.cfStack.pushValue(new I64TruncF32U(operand))
         break
 
       case OPCODES.I64_TRUNC_U_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.I64)
+        f.cfStack.spillValueIfComposite()
+        var operand = f.cfStack.popValue(TYPES.F64)
         // XXX TODO: I actually don't understand floating-point much at all,
         //           right now am just hacking the tests into passing...
-        f.pushLine("if (" + operand + " >= 18446744073709551616.0) { return trap('too big') }")
-        f.pushLine("if (" + operand + " <= -1) { return trap('too small') }")
-        f.pushLine("if (isNaN(" + operand + ")) { return trap('NaN') }")
-        f.pushLine(output + " = Long.fromNumber(f64_trunc(" + operand + "), true).toSigned()")
+        f.cfStack.addTrapCondition(new F64CompareOp('>=', operand, new F64Constant(18446744073709551616.0)))
+        f.cfStack.addTrapCondition(new F64CompareOp('<=', operand, new F64Constant(-1)))
+        f.cfStack.addTrapCondition(new F64IsNaN(operand))
+        f.cfStack.pushValue(new I64TruncF64U(operand))
         break
 
       case OPCODES.F32_CONVERT_S_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = ToF32(" + operand + "|0)")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new F32FromI32S(operand))
         break
 
       case OPCODES.F32_CONVERT_U_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = ToF32(" + operand + ">>>0)")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new F32FromI32U(operand))
         break
 
       case OPCODES.F32_CONVERT_S_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = ToF32(" + operand + ".toNumber())")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new F32FromI64S(operand))
         break
 
       case OPCODES.F32_CONVERT_U_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = ToF32(" + operand + ".toUnsigned().toNumber())")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new F32FromI64U(operand))
         break
 
       case OPCODES.F32_DEMOTE_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = ToF32(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.F64)
+        f.cfStack.pushValue(new F32FromF64(operand))
         break
 
       case OPCODES.F64_CONVERT_S_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = +(" + operand + "|0)")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new F64FromI32S(operand))
         break
 
       case OPCODES.F64_CONVERT_U_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = +(" + operand + ">>>0)")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new F64FromI32U(operand))
         break
 
       case OPCODES.F64_CONVERT_S_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = +(" + operand + ".toNumber())")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new F64FromI64S(operand))
         break
 
       case OPCODES.F64_CONVERT_U_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = +(" + operand + ".toUnsigned().toNumber())")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new F64FromI64U(operand))
         break
 
       case OPCODES.F64_PROMOTE_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = +(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.F32)
+        f.cfStack.pushValue(new F64FromF32(operand))
         break
 
       case OPCODES.I32_REINTERPRET_F32:
-        var operand = f.cfStack.popVar(TYPES.F32)
-        var output = f.cfStack.pushVar(TYPES.I32)
-        f.pushLine(output + " = i32_reinterpret_f32(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.F32)
+        f.cfStack.pushValue(new I32ReinterpretF32(operand))
         break
 
       case OPCODES.I64_REINTERPRET_F64:
-        var operand = f.cfStack.popVar(TYPES.F64)
-        var output = f.cfStack.pushVar(TYPES.I64)
-        f.pushLine(output + " = i64_reinterpret_f64(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.F64)
+        f.cfStack.pushValue(new I64ReinterpretF64(operand))
         break
 
       case OPCODES.F32_REINTERPRET_I32:
-        var operand = f.cfStack.popVar(TYPES.I32)
-        var output = f.cfStack.pushVar(TYPES.F32)
-        f.pushLine(output + " = f32_reinterpret_i32(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.I32)
+        f.cfStack.pushValue(new F32ReinterpretI32(operand))
         break
 
       case OPCODES.F64_REINTERPRET_I64:
-        var operand = f.cfStack.popVar(TYPES.I64)
-        var output = f.cfStack.pushVar(TYPES.F64)
-        f.pushLine(output + " = f64_reinterpret_i64(" + operand + ")")
+        var operand = f.cfStack.popValue(TYPES.I64)
+        f.cfStack.pushValue(new F64ReinterpretI64(operand))
         break
 
       default:
@@ -1539,31 +1182,47 @@ export default function translateFunctionCode(s, r, f) {
   }
 
   // OK, we're now in a position to render the function code.
+
+  function getLocalVarName(index, typ) {
+    typ = typ || f.getLocalTypeByIndex(index)
+    switch (typ) {
+      case TYPES.I32:
+        return "li" + index
+      case TYPES.I64:
+        return "ll" + index
+      case TYPES.F32:
+        return "lf" + index
+      case TYPES.F64:
+        return "ld" + index
+      default:
+        throw new CompileError("unexpected type of local")
+    }
+  }
   
   var params = []
   f.sig.param_types.forEach(function(typ, idx) {
-    params.push(getLocalVar(idx, typ, true))
+    params.push(getLocalVarName(idx, typ, true))
   })
   r.putln("function ", f.name, "(", params.join(","), ") {")
 
   // Coerce parameters to appropriate types
 
   f.sig.param_types.forEach(function(typ, idx) {
-    var nm = getLocalVar(idx, typ)
+    var nm = getLocalVarName(idx, typ)
     switch (typ) {
       case TYPES.I32:
-        r.putln(nm, " = ", nm, "|0")
+        r.putln("  ", nm, " = ", nm, "|0")
         break
       case TYPES.I64:
         // No typecasting as it's not valid asmjs anyway.
         break
       case TYPES.F32:
-        // XXX TODO: This breaks our NaN-boxing
-        // r.putln(nm, " = fround(", nm, ")")
+        // XXX TODO: asmjs-style cast breaks our NaN-boxing
+        r.putln("  ", nm, " = ToF32(", nm, ")")
         break
       case TYPES.F64:
-        // XXX TODO: This breaks our NaN-boxing
-        // r.putln(nm, " = +", nm)
+        // XXX TODO: asmjs-style cast breaks our NaN-boxing
+        // r.putln("  ", nm, " = +", nm)
         break
     }
   })
@@ -1573,54 +1232,165 @@ export default function translateFunctionCode(s, r, f) {
   var idx = f.sig.param_types.length
   f.locals.forEach(function(l) {
     for (var i = 0; i < l.count; i++) {
-      var nm = getLocalVar(idx++, l.type)
+      var nm = getLocalVarName(idx++, l.type)
       switch (l.type) {
         case TYPES.I32:
-          r.putln("var ", nm, " = 0")
+          r.putln("  var ", nm, " = 0")
           break
         case TYPES.I64:
-          r.putln("var ", nm, " = new Long(0, 0)")
+          r.putln("  var ", nm, " = new Long(0, 0)")
           break
         case TYPES.F32:
-          r.putln("var ", nm, " = fround(0.0)")
+          r.putln("  var ", nm, " = fround(0.0)")
           break
         case TYPES.F64:
-          r.putln("var ", nm, " = 0.0")
+          r.putln("  var ", nm, " = 0.0")
           break
       }
     }
   })
 
-  // Declare stack variables
+  // Declare temporary variables
 
   ;([TYPES.I32, TYPES.I64, TYPES.F32, TYPES.F64]).forEach(function(typ) {
-    var height = f.cfStack.maxStackHeights[typ]
-    for (var i = 0; i < height; i++) {
+    var count = f.cfStack.tempvars[typ].count
+    for (var i = 0; i < count; i++) {
       switch (typ) {
         case TYPES.I32:
-          r.putln("var si", i, " = 0")
+          r.putln("  var ti", i, " = 0")
           break
         case TYPES.I64:
-          r.putln("var sl", i, " = new Long(0, 0)")
+          r.putln("  var tl", i, " = new Long(0, 0)")
           break
         case TYPES.F32:
-          r.putln("var sf", i, " = fround(0.0)")
+          r.putln("  var tf", i, " = fround(0.0)")
           break
         case TYPES.F64:
-          r.putln("var sf", i, " = 0.0")
+          r.putln("  var td", i, " = 0.0")
           break
       }
     }
   })
 
-  // Spit out all the pre-prepared body code lines.
-
-  f.bodyLines.forEach(function(ln) {
-    r.putln(ln)
-  })
+  // Render the body itself.
+  funcBody.render(r)
 
   // Phew!  That's everything for this function.
   r.putln("}")
+}
+
+
+//
+// A bunch of helpers for constructing different kinds of expression.
+//
+
+function i32_unaryOp(f, what) {
+  var operand = f.cfStack.popValue(TYPES.I32)
+  f.cfStack.pushValue(new I32UnaryOp(what, operand))
+}
+
+function i32_unaryOp_u(f, what) {
+  var operand = f.cfStack.popValue(TYPES.I32)
+  f.cfStack.pushValue(new UI32UnaryOp(what, operand))
+}
+
+function i32_binaryOp(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.I32)
+  var lhs = f.cfStack.popValue(TYPES.I32)
+  f.cfStack.pushValue(new I32BinOp(what, lhs, rhs))
+}
+
+function i32_binaryOp_u(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.I32)
+  var lhs = f.cfStack.popValue(TYPES.I32)
+  f.cfStack.pushValue(new UI32BinOp(what, lhs, rhs))
+}
+
+function i32_binaryFunc(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.I32)
+  var lhs = f.cfStack.popValue(TYPES.I32)
+  f.cfStack.pushValue(new I32BinFunc(what, lhs, rhs))
+}
+
+function i64_unaryFunc(f, what) {
+  var operand = f.cfStack.popValue(TYPES.I64)
+  f.cfStack.pushValue(new I64UnaryFunc(what, operand))
+}
+
+function i64_binaryFunc(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.I64)
+  var lhs = f.cfStack.popValue(TYPES.I64)
+  f.cfStack.pushValue(new I64BinFunc(what, lhs, rhs))
+}
+
+function i64_compareFunc(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.I64)
+  var lhs = f.cfStack.popValue(TYPES.I64)
+  f.cfStack.pushValue(new I64CompareFunc(what, lhs, rhs))
+}
+
+function f32_compareOp(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F32)
+  var lhs = f.cfStack.popValue(TYPES.F32)
+  f.cfStack.pushValue(new F32CompareOp(what, lhs, rhs))
+}
+
+function f32_unaryOp(f, what) {
+  var operand = f.cfStack.popValue(TYPES.F32)
+  f.cfStack.pushValue(new F32UnaryOp(what, operand))
+}
+
+function f32_binaryOp(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F32)
+  var lhs = f.cfStack.popValue(TYPES.F32)
+  f.cfStack.pushValue(new F32BinOp(what, lhs, rhs))
+}
+
+function f32_binaryFunc(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F32)
+  var lhs = f.cfStack.popValue(TYPES.F32)
+  f.cfStack.pushValue(new F32BinFunc(what, lhs, rhs))
+}
+
+function f64_compareOp(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F64)
+  var lhs = f.cfStack.popValue(TYPES.F64)
+  f.cfStack.pushValue(new F64CompareOp(what, lhs, rhs))
+}
+
+function f64_unaryOp(f, what) {
+  var operand = f.cfStack.popValue(TYPES.F64)
+  f.cfStack.pushValue(new F64UnaryOp(what, operand))
+}
+
+function f64_binaryOp(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F64)
+  var lhs = f.cfStack.popValue(TYPES.F64)
+  f.cfStack.pushValue(new F64BinOp(what, lhs, rhs))
+}
+
+function f64_binaryFunc(f, what) {
+  var rhs = f.cfStack.popValue(TYPES.F64)
+  var lhs = f.cfStack.popValue(TYPES.F64)
+  f.cfStack.pushValue(new F64BinFunc(what, lhs, rhs))
+}
+
+function addBoundsCheckTrapCondition(f, addr, offset, size) {
+  // A large offset might underflow when subtracting from memorySize,
+  // so we add a separate check that it's within memory bounds.
+  // XXX TODO: optimize this away most of the time.
+  if (offset + size > stdlib.UINT32_MAX) {
+    f.cfStack.addTrapCondition(new I32Constant(1))
+  } else {
+    f.cfStack.addTrapCondition(new UI32BinOp('<',
+      new GetRawMemorySize(),
+      new I32Constant(offset + size)
+    ))
+  }
+  f.cfStack.addTrapCondition(new UI32BinOp('>',
+    addr,
+    new UI32BinOp('-', new GetRawMemorySize(), new I32Constant(offset + size))
+  ))
 }
 
 
@@ -1632,174 +1402,77 @@ export default function translateFunctionCode(s, r, f) {
 
 function ControlFlowStack() {
   this.stack = []
-  this.maxStackHeights = {}
-  this.maxStackHeights[TYPES.I32] = 0
-  this.maxStackHeights[TYPES.I64] = 0
-  this.maxStackHeights[TYPES.F32] = 0
-  this.maxStackHeights[TYPES.F64] = 0
+  this.tempvars = {}
+  this.tempvars[TYPES.I32] = { count: 0, free: [] }
+  this.tempvars[TYPES.I64] = { count: 0, free: [] }
+  this.tempvars[TYPES.F32] = { count: 0, free: [] }
+  this.tempvars[TYPES.F64] = { count: 0, free: [] }
 }
 
-// Push a new control-flow context onto the stack.
-
-ControlFlowStack.prototype.push = function push(op, sig, endReached) {
-  var prev = null
-  var prevStackHeights = {}
-  if (this.stack.length === 0) {
-    prevStackHeights[TYPES.I32] = 0
-    prevStackHeights[TYPES.I64] = 0
-    prevStackHeights[TYPES.F32] = 0
-    prevStackHeights[TYPES.F64] = 0
-  } else {
-    var prev = this.stack[this.stack.length - 1]
-    prevStackHeights[TYPES.I32] = prev.prevStackHeights[TYPES.I32]
-    prevStackHeights[TYPES.I64] = prev.prevStackHeights[TYPES.I64]
-    prevStackHeights[TYPES.F32] = prev.prevStackHeights[TYPES.F32]
-    prevStackHeights[TYPES.F64] = prev.prevStackHeights[TYPES.F64]
-    prev.typeStack.forEach(function(typ) {
-      prevStackHeights[typ] += 1
-    })
+ControlFlowStack.prototype.push = function push(cf) {
+  var parent = null
+  if (this.stack.length > 0) {
+    parent = this.stack[this.stack.length - 1]
   }
-  this.stack.push({
-    op: op,
-    sig: sig,
-    index: this.stack.length,
-    label: "L" + this.stack.length,
-    isPolymorphic: false,
-    isDead: prev ? prev.isDead : false,
-    endReached: !!endReached,
-    typeStack: [],
-    prevStackHeights: prevStackHeights
-  })
-  return this.stack[this.stack.length - 1]
+  cf.initialize(this.stack.length, parent, this.tempvars)
+  this.stack.push(cf)
+  return cf
 }
-
-// Pop the topmost control-flow context from the stack.
 
 ControlFlowStack.prototype.pop = function pop() {
-  return this.stack.pop()
+  var cf = this.stack.pop()
+  cf.markEndOfBlock()
+  if (this.stack.length > 0) {
+    this.peek().addStatement(cf)
+    if (cf.endReached) {
+      if (cf.resultType !== TYPES.NONE) {
+        this.peek().pushValue(new GetTempVar(cf.resultType, cf.getResultVar()))
+      }
+    } else {
+      this.markDeadCode()
+    }
+  }
+  return cf
 }
-
-// Peek at the topmost control-flow context on the stack.
 
 ControlFlowStack.prototype.peek = function peek() {
   return this.stack[this.stack.length - 1]
 }
 
-// Mark the topmost control-flow context as dead from this point on.
+ControlFlowStack.prototype.peekBottom = function peekBottom() {
+  return this.stack[0]
+}
 
 ControlFlowStack.prototype.markDeadCode = function markDeadCode() {
-  var cf = this.stack[this.stack.length - 1]
-  cf.isDead = true
-  cf.isPolymorphic = true
-  cf.typeStack = []
+  this.peek().markDeadCode()
 }
-
-// Check whether the topmost control-flow context is in dead code.
 
 ControlFlowStack.prototype.isDeadCode = function isDeadCode() {
-  return this.stack[this.stack.length - 1].isDead
+  return this.peek().isDead
 }
 
-// Push a new stack entry of the given type, return corresponding variable.
-
-ControlFlowStack.prototype.pushVar = function pushVar(typ) {
-  this.stack[this.stack.length - 1].typeStack.push(typ)
-  return this.getVar(typ)
+ControlFlowStack.prototype.addStatement = function addStatement(stmt) {
+  return this.peek().addStatement(stmt)
 }
 
-// Find out what type is current on top of the value stack.
+ControlFlowStack.prototype.addTerminalStatement = function addTerminalStatement(stmt) {
+  return this.peek().addTerminalStatement(stmt)
+}
+
+ControlFlowStack.prototype.pushValue = function pushValue(expr) {
+  return this.peek().pushValue(expr)
+}
 
 ControlFlowStack.prototype.peekType = function peekType() {
-  var cf = this.stack[this.stack.length - 1]
-  var stack = cf.typeStack
-  if (stack.length === 0) {
-    if (! cf.isPolymorphic) {
-      throw new CompileError("nothing on the stack")
-    }
-    return TYPES.UNKNOWN
-  }
-  return stack[stack.length - 1]
+  return this.peek().peekType()
 }
 
-// Pop the topmost entry from the stack, returning its corresponding variable.
-// You must specify the expected type.
-
-ControlFlowStack.prototype.popVar = function popVar(wantType) {
-  var name = this.getVar(wantType)
-  var cf = this.stack[this.stack.length - 1]
-  var typ = cf.typeStack.pop()
-  if (wantType !== TYPES.UNKNOWN && typ !== wantType && typ !== TYPES.UNKNOWN) {
-    if (! cf.isPolymorphic) {
-      throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + typ)
-    }
-    return "UNREACHABLE"
-  }
-  return name
+ControlFlowStack.prototype.peekValue = function peekValue(wantType) {
+  return this.peek().peekValue(wantType)
 }
 
-// Get the variable for the topmost item on the stack.
-// You must provide the expected type.
-
-ControlFlowStack.prototype.getVar = function getVar(wantType, pos) {
-  var cf = this.stack[this.stack.length - 1]
-  var where = cf.typeStack.length - 1 - (pos || 0)
-  if (where < 0) {
-    if (! cf.isPolymorphic) {
-      throw new CompileError("stack access outside current block")
-    }
-    return "UNREACHABLE"
-  }
-  var typ = cf.typeStack[where]
-  if (typ !== wantType && typ !== TYPES.UNKNOWN && wantType !== TYPES.UNKNOWN) {
-    throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + typ)
-  }
-  var height = cf.prevStackHeights[typ]
-  for (var i = 0; i < where; i++) {
-    if (cf.typeStack[i] === typ) {
-      height += 1
-    }
-  }
-  if (height >= this.maxStackHeights[typ]) {
-    this.maxStackHeights[typ] = height + 1
-  }
-  switch (typ) {
-    case TYPES.I32:
-      return "si" + height
-    case TYPES.I64:
-      return "sl" + height
-    case TYPES.F32:
-      return "sf" + height
-    case TYPES.F64:
-      return "sd" + height
-    case TYPES.UNKNOWN:
-      return "UNREACHABLE"
-      break
-    default:
-      throw new CompileError("unexpected type on stack: " + typ)
-  }
-}
-
-// Get the stack variable into which the given block
-// should store its output.
-
-ControlFlowStack.prototype.getBlockOutputVar = function getBlockOutputVar(index) {
-  var cf = this.getBranchTarget(index)
-  if (cf.sig === TYPES.NONE) {
-    throw new CompileError("No output from void block")
-  }
-  var height = cf.prevStackHeights[cf.sig]
-  switch (cf.sig) {
-    case TYPES.I32:
-      return "si" + height
-    case TYPES.I64:
-      return "sl" + height
-    case TYPES.F32:
-      return "sf" + height
-    case TYPES.F64:
-      return "sd" + height
-    default:
-      throw new CompileError("unexpected type on stack")
-  }
+ControlFlowStack.prototype.popValue = function popValue(wantType) {
+  return this.peek().popValue(wantType)
 }
 
 ControlFlowStack.prototype.getBranchTarget = function getBranchTarget(depth) {
@@ -1810,249 +1483,1980 @@ ControlFlowStack.prototype.getBranchTarget = function getBranchTarget(depth) {
   return this.stack[which]
 }
 
+ControlFlowStack.prototype.spillValue = function spillValue() {
+  return this.peek().spillValue()
+}
+
+ControlFlowStack.prototype.spillValueIfComposite = function spillValueIfComposite() {
+  var v = this.peekValue()
+  if (v instanceof _GetVar) {
+    return v
+  }
+  if (v instanceof _Constant) {
+    return v
+  }
+  return this.spillValue()
+}
+
+ControlFlowStack.prototype.spillAllValues = function spillAllValues() {
+  for (var i = 0; i < this.stack.length; i++) {
+    this.stack[i].spillAllValues()
+  }
+}
+
+ControlFlowStack.prototype.addTrapCondition = function addTrapCondition(expr) {
+  this.peek().addTrapCondition(expr)
+}
+
+ControlFlowStack.prototype.finalizeTrapConditions = function finalizeTrapConditions() {
+  this.peek().finalizeTrapConditions()
+}
+
 
 //
-// A bunch of helpers for rendering different kinds of expression.
+// Classes for all of the many different kinds of expression
+// we can build up.  These get acumulated on the value stack,
+// as we traverse the function code, and eventually rendered
+// into javascript expressions.  The hope is that by building
+// up the expression in memory, we can avoid using lots of
+// temporary variables in the generated JavaScript.
 //
 
-function i32_unaryOp(f, what, cast) {
-  cast = cast || "|0"
-  var operand = f.cfStack.getVar(TYPES.I32)
-  f.pushLine(operand + " = (" + what + "(" + operand + "))" + cast)
+function _Expr(type) {
+  this.type = type
 }
+inherits(_Expr, Object, {
+  render: function render(r) {
+    throw new CompileError('not implemented')
+  },
 
-function i32_binaryOp(f, what, cast) {
-  cast = cast || "|0"
-  var rhs = "(" + f.cfStack.popVar(TYPES.I32) + cast + ")"
-  var lhs = "(" + f.cfStack.popVar(TYPES.I32) + cast + ")"
-  f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = (" + lhs + what + rhs + ")" + cast)
-}
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+  }
+})
 
-function i32_binaryFunc(f, what, cast) {
-  cast = cast || "|0"
-  var rhs = "(" + f.cfStack.popVar(TYPES.I32) + cast + ")"
-  var lhs = "(" + f.cfStack.popVar(TYPES.I32) + cast + ")"
-  f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = (" + what + "(" + lhs + ", " + rhs + "))" + cast)
-}
 
-function i64_unaryFunc(f, what) {
-  var operand = f.cfStack.getVar(TYPES.I64)
-  f.pushLine(operand + " = " + what + "(" + operand + ")")
+function Undefined() {
+  _Expr.call(this, TYPES.UNKNOWN)
 }
+inherits(Undefined, _Expr, {
+  render: function render(r) {
+    r.putstr("(UNDEFINED)")
+  }
+})
 
-function i64_binaryFunc(f, what) {
-  var rhs = "(" + f.cfStack.popVar(TYPES.I64) + ")"
-  var lhs = "(" + f.cfStack.popVar(TYPES.I64) + ")"
-  f.pushLine(f.cfStack.pushVar(TYPES.I64) + " = " + what + "(" + lhs + ", " + rhs + ")")
-}
 
-function i64_compareFunc(f, what) {
-  var rhs = "(" + f.cfStack.popVar(TYPES.I64) + ")"
-  var lhs = "(" + f.cfStack.popVar(TYPES.I64) + ")"
-  f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = " + what + "(" + lhs + ", " + rhs + ")|0")
-}
 
-function f32_compareOp(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F32)
-  var lhs = f.cfStack.popVar(TYPES.F32)
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = (" + lhs + " " + what + " " + rhs + ")|0")
+function _GetVar(type, index) {
+  _Expr.call(this, type)
+  this.index = index
 }
+inherits(_GetVar, _Expr, {
+  render: function render(r) {
+    switch (this.type) {
+      case TYPES.I32:
+        r.putstr(this.namePrefix)
+        r.putstr("i")
+        r.putstr(this.index)
+        break
+      case TYPES.I64:
+        r.putstr(this.namePrefix)
+        r.putstr("l")
+        r.putstr(this.index)
+        break
+      case TYPES.F32:
+        r.putstr(this.namePrefix)
+        r.putstr("f")
+        r.putstr(this.index)
+        break
+      case TYPES.F64:
+        r.putstr(this.namePrefix)
+        r.putstr("d")
+        r.putstr(this.index)
+        break
+      default:
+        throw new CompileError("unexpected type for variable: " + this.type)
+    }
+  },
 
-function f32_unaryOp(f, what) {
-  var operand = f.cfStack.popVar(TYPES.F32)
-  f.pushLine(f.cfStack.pushVar(TYPES.F32) + " = ToF32(" + what +"(" + operand + "))")
-}
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    cb(this)
+  }
+})
 
-function f32_binaryOp(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F32)
-  var lhs = f.cfStack.popVar(TYPES.F32)
-  f.pushLine(f.cfStack.pushVar(TYPES.F32) + " = ToF32(" + lhs + " " + what + " " + rhs + ")")
-}
 
-function f32_binaryFunc(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F32)
-  var lhs = f.cfStack.popVar(TYPES.F32)
-  f.pushLine(f.cfStack.pushVar(TYPES.F32) + " = ToF32(" + what + "(" + lhs + ", " + rhs + "))")
+function GetTempVar(type, index) {
+  _GetVar.call(this, type, index)
 }
+inherits(GetTempVar, _GetVar, {
+  namePrefix: "t"
+})
 
-function f64_compareOp(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F64)
-  var lhs = f.cfStack.popVar(TYPES.F64)
-  f.pushLine(f.cfStack.pushVar(TYPES.I32) + " = (" + lhs + " " + what + " " + rhs + ")|0")
-}
 
-function f64_unaryOp(f, what) {
-  var operand = f.cfStack.popVar(TYPES.F64)
-  f.pushLine(f.cfStack.pushVar(TYPES.F64) + " = " + what +"(" + operand + ")")
+function GetLocal(type, index) {
+  _GetVar.call(this, type, index)
 }
+inherits(GetLocal, _GetVar, {
+  namePrefix: "l"
+})
 
-function f64_binaryOp(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F64)
-  var lhs = f.cfStack.popVar(TYPES.F64)
-  f.pushLine(f.cfStack.pushVar(TYPES.F64) + " = " + lhs + " " + what + " " + rhs)
-}
 
-function f64_binaryFunc(f, what) {
-  var rhs = f.cfStack.popVar(TYPES.F64)
-  var lhs = f.cfStack.popVar(TYPES.F64)
-  f.pushLine(f.cfStack.pushVar(TYPES.F64) + " = " + what + "(" + lhs + ", " + rhs + ")")
+function GetGlobal(type, index) {
+  _GetVar.call(this, type, index)
 }
+inherits(GetGlobal, _GetVar, {
+  namePrefix: "G"
+})
 
-function boundsCheck(f, addr, offset, size) {
-  f.pushLine("if ((" + addr + ">>>0) + " + (offset + size) + " > memorySize) { return trap('OOB') }")
-}
 
-function i32_load_unaligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = i32_load_unaligned(" + addr + " + " + offset + ")")
+function _Constant(type, value) {
+  _Expr.call(this, type)
+  this.value = value
 }
+inherits(_Constant, _Expr, {
+  render: function render(r) {
+    r.putstr(stringifyJSValue(this.value))
+  }
+})
 
-function i32_load_aligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-  f.pushLine("  " + res + " = i32_load_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = HI32[(" + addr + " + " + offset + ")>>2]")
-  f.pushLine("}")
-}
 
-function i32_load8_s(f, addr, offset, value) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = HI8[(" + addr + " + " + offset + ")]")
+function I32Constant(value) {
+  _Constant.call(this, TYPES.I32, value)
 }
+inherits(I32Constant, _Constant)
 
-function i32_load8_u(f, addr, offset, value) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = HU8[(" + addr + " + " + offset + ")]")
-}
 
-function i32_load16_s_unaligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = i32_load16_s_unaligned(" + addr + " + " + offset + ")")
+function I64Constant(value) {
+  _Constant.call(this, TYPES.I64, value)
 }
+inherits(I64Constant, _Constant)
 
-function i32_load16_u_unaligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine(res + " = i32_load16_u_unaligned(" + addr + " + " + offset + ")")
-}
 
-function i32_load16_s_aligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
-  f.pushLine("  " + res + " = i32_load16_s_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = HI16[(" + addr + " + " + offset + ")>>1]")
-  f.pushLine("}")
+function F32Constant(value) {
+  _Constant.call(this, TYPES.F32, value)
 }
+inherits(F32Constant, _Constant)
 
-function i32_load16_u_aligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.I32)
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
-  f.pushLine("  " + res + " = i32_load16_u_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = HU16[(" + addr + " + " + offset + ")>>1]")
-  f.pushLine("}")
-}
 
-function i32_store_unaligned(f, addr, offset, value) {
-  f.pushLine("i32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
+function F64Constant(value) {
+  _Constant.call(this, TYPES.F64, value)
 }
+inherits(F64Constant, _Constant)
 
-function i32_store_aligned(f, addr, offset, value) {
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-  f.pushLine("  i32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
-  f.pushLine("} else {")
-  f.pushLine("  HI32[(" + addr + " + " + offset + ")>>2] = " + value)
-  f.pushLine("}")
-}
 
-function i32_store8(f, addr, offset, value) {
-  f.pushLine("HU8[(" + addr + " + " + offset + ")] = " + value)
-}
 
-function i32_store16(f, addr, offset, value) {
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x01) {")
-  f.pushLine("  i32_store16_unaligned(" + addr + " + " + offset + ", " + value + ")")
-  f.pushLine("} else {")
-  f.pushLine("  HU16[(" + addr + " + " + offset + ")>>1] = " + value)
-  f.pushLine("}")
-}
+// Loads from memory
 
-function f32_load_unaligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.F32)
-  f.pushLine(res + " = f32_load_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine(res + " = f32_load_fix_signalling(" + res + ", " + addr + " + " + offset + ")")
-}
 
-function f32_load_aligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.F32)
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-  f.pushLine("  " + res + " = f32_load_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = HF32[(" + addr + " + " + offset + ")>>2]")
-  f.pushLine("}")
-  f.pushLine(res + " = f32_load_fix_signalling(" + res + ", " + addr + " + " + offset + ")")
+function _Load(type, addr, offset, size, flags) {
+  _Expr.call(this, type)
+  this.addr = addr
+  this.offset = offset
+  this.flags = flags
 }
+inherits(_Load, _Expr, {
+  renderUnaligned: function renderUnaligned(r, func) {
+    r.putstr(func)
+    r.putstr("((")
+    this.addr.render(r)
+    r.putstr(") + ")
+    r.putstr(this.offset)
+    r.putstr(")")
+  },
 
-function f32_store_unaligned(f, addr, offset, value) {
-  f.pushLine("f32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
-  f.pushLine("f32_store_fix_signalling(" + value + ", " + addr + " + " + offset + ")")
-}
+  renderMaybeAligned: function renderMaybeAligned(r, mask, shift, ta, fallback) { 
+    if (! isLittleEndian) {
+      this.renderUnaligned(r, fallback)
+    } else {
+      r.putstr("((((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(") & ")
+      r.putstr(mask)
+      r.putstr(") ? ")
+      r.putstr(fallback)
+      r.putstr("((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(") : (")
+      r.putstr(ta)
+      r.putstr("[((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(")>>")
+      r.putstr(shift)
+      r.putstr("]")
+      r.putstr("))")
+    }
+  },
 
-function f32_store_aligned(f, addr, offset, value) {
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x03) {")
-  f.pushLine("  f32_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
-  f.pushLine("} else {")
-  f.pushLine("  HF32[(" + addr + " + " + offset + ")>>2] = " + value)
-  f.pushLine("}")
-  f.pushLine("f32_store_fix_signalling(" + value + ", " + addr + " + " + offset + ")")
-}
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.addr.walkConsumedVariables(cb)
+  }
+})
 
-function f64_load_unaligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.F64)
-  f.pushLine(res + " = f64_load_unaligned(" + addr + " + " + offset + ")")
-}
 
-function f64_load_aligned(f, addr, offset) {
-  var res = f.cfStack.pushVar(TYPES.F64)
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
-  f.pushLine("  " + res + " = f64_load_unaligned(" + addr + " + " + offset + ")")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = HF64[(" + addr + " + " + offset + ")>>3]")
-  f.pushLine("}")
+function I32Load(addr, offset, flags) {
+  _Load.call(this, TYPES.I32, addr, offset, 4, flags)
 }
+inherits(I32Load, _Load, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+      case 1:
+        this.renderUnaligned(r, "i32_load_unaligned")
+        break
+      case 2:
+        this.renderMaybeAligned(r, "0x03", "2", "HI32", "i32_load_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+  }
+})
 
-function f64_store_unaligned(f, addr, offset, value) {
-  f.pushLine("f64_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
-}
 
-function f64_store_aligned(f, addr, offset, value) {
-  f.pushLine("if ((" + addr + " + " + offset + ") & 0x07) {")
-  f.pushLine("  f64_store_unaligned(" + addr + " + " + offset + ", " + value + ")")
-  f.pushLine("} else {")
-  f.pushLine("  HF64[(" + addr + " + " + offset + ")>>3] = " + value)
-  f.pushLine("}")
+function F32Load(addr, offset, flags) {
+  _Load.call(this, TYPES.F32, addr, offset, 4, flags)
 }
+inherits(F32Load, _Load, {
+  render: function render(r) {
+    // XXX TODO: don't emit the NaN-fixup stuff if we don't need it,
+    // either because the platform doesn't need it, or because we can
+    // prove that the value will be canonicalized.
+    if (! isNaNPreserving32) {
+      r.putstr("f32_load_nan_bitpattern(")
+    }
+    switch (this.flags) {
+      case 0:
+      case 1:
+        this.renderUnaligned(r, "f32_load_unaligned")
+        break
+      case 2:
+        this.renderMaybeAligned(r, "0x03", "2", "HF32", "f32_load_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+    if (! isNaNPreserving32) {
+      r.putstr(",(")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(")")
+    }
+  }
+})
 
-function i64_from_i32_s(f) {
-  var low32 = f.cfStack.popVar(TYPES.I32)
-  var res = f.cfStack.pushVar(TYPES.I64)
-  // Sign-extend into 64 bits
-  f.pushLine("if (" + low32 + " & 0x80000000) {")
-  f.pushLine("  " + res + " = new Long(" + low32 + ", -1)")
-  f.pushLine("} else {")
-  f.pushLine("  " + res + " = new Long(" + low32 + ", 0)")
-  f.pushLine("}")
-}
 
-function i64_from_i32_u(f) {
-  var low32 = f.cfStack.popVar(TYPES.I32)
-  f.pushLine(f.cfStack.pushVar(TYPES.I64) + " = new Long(" + low32 + ", 0)")
+function F64Load(addr, offset, flags) {
+  _Load.call(this, TYPES.F64, addr, offset, 8, flags)
 }
+inherits(F64Load, _Load, {
+  render: function render(r) {
+    // XXX TODO: don't emit the NaN-fixup stuff if we don't need it,
+    // either because the platform doesn't need it, or because we can
+    // prove that the value will be canonicalized.
+    if (! isNaNPreserving64) {
+      r.putstr("f64_load_nan_bitpattern(")
+    }
+    switch (this.flags) {
+      case 0:
+      case 1:
+      case 2:
+        this.renderUnaligned(r, "f64_load_unaligned")
+        break
+      case 3:
+        this.renderMaybeAligned(r, "0x07", "3", "HF64", "f64_load_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+    if (! isNaNPreserving64) {
+      r.putstr(",(")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(")")
+    }
+  }
+})
 
-function i64_from_i32x2(f) {
-  var high32 = f.cfStack.popVar(TYPES.I32)
-  var low32 = f.cfStack.popVar(TYPES.I32)
-  f.pushLine(f.cfStack.pushVar(TYPES.I64) + " = new Long(" + low32 + ", " + high32 + ")")
+
+function I32Load8S(addr, offset, flags) {
+  _Load.call(this, TYPES.I32, addr, offset, 1, flags)
 }
+inherits(I32Load8S, _Load, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        r.putstr("HI8[(")
+        this.addr.render(r)
+        r.putstr(")+")
+        r.putstr(this.offset)
+        r.putstr("]")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+  }
+})
+
+
+function I32Load8U(addr, offset, flags) {
+  _Load.call(this, TYPES.I32, addr, offset, 1, flags)
+}
+inherits(I32Load8U, _Load, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        r.putstr("HU8[(")
+        this.addr.render(r)
+        r.putstr(")+")
+        r.putstr(this.offset)
+        r.putstr("]")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+  }
+})
+
+
+function I32Load16S(addr, offset, flags) {
+  _Load.call(this, TYPES.I32, addr, offset, 2, flags)
+}
+inherits(I32Load16S, _Load, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        this.renderUnaligned(r, "i32_load16_s_unaligned")
+        break
+      case 1:
+        this.renderMaybeAligned(r, "0x01", "1", "HI16", "i32_load16_s_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+  }
+})
+
+
+function I32Load16U(addr, offset, flags) {
+  _Load.call(this, TYPES.I32, addr, offset, 2, flags)
+}
+inherits(I32Load16U, _Load, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        this.renderUnaligned(r, "i32_load16_u_unaligned")
+        break
+      case 1:
+        this.renderMaybeAligned(r, "0x01", "1", "HU16", "i32_load16_u_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported load flags")
+    }
+  }
+})
+
+
+function _UnaryOp(type, operand) {
+  _Expr.call(this, type)
+  this.operand = operand
+}
+inherits(_UnaryOp, _Expr, {
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.operand.walkConsumedVariables(cb)
+  }
+})
+
+
+function _BinaryOp(type, lhs, rhs) {
+  _Expr.call(this, type)
+  this.lhs = lhs
+  this.rhs = rhs
+
+}
+inherits(_BinaryOp, _Expr, {
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.lhs.walkConsumedVariables(cb)
+    this.rhs.walkConsumedVariables(cb)
+  }
+})
+
+
+function I32Eqz(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32Eqz, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(!")
+    this.operand.render(r)
+    r.putstr(")|0")
+  }
+})
+
+function I32UnaryOp(what, operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+  this.what = what
+}
+inherits(I32UnaryOp, _UnaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function I32BinOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(I32BinOp, _BinaryOp, {
+  render: function render(r) {
+    r.putstr("(((")
+    this.lhs.render(r)
+    r.putstr(")|0)")
+    r.putstr(this.what)
+    r.putstr("((")
+    this.rhs.render(r)
+    r.putstr(")|0)")
+    r.putstr(")|0")
+  }
+})
+
+
+function UI32BinOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(UI32BinOp, _BinaryOp, {
+  render: function render(r) {
+    r.putstr("(((")
+    this.lhs.render(r)
+    r.putstr(")>>>0)")
+    r.putstr(this.what)
+    r.putstr("((")
+    this.rhs.render(r)
+    r.putstr(")>>>0)")
+    r.putstr(")|0")
+  }
+})
+
+
+function I32BinFunc(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(I32BinFunc, _BinaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("((")
+    this.lhs.render(r)
+    r.putstr(")|0")
+    r.putstr(",(")
+    this.rhs.render(r)
+    r.putstr(")|0")
+    r.putstr(")")
+  }
+})
+
+
+function I64Eqz(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I64Eqz, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(".isZero())|0")
+  }
+})
+
+function I64UnaryFunc(what, operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+  this.what = what
+}
+inherits(I64UnaryFunc, _UnaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function I64BinFunc(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I64, lhs, rhs)
+  this.what = what
+}
+inherits(I64BinFunc, _BinaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.lhs.render(r)
+    r.putstr(",")
+    this.rhs.render(r)
+    r.putstr(")")
+  }
+})
+
+function I64CompareFunc(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(I64CompareFunc, _BinaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.lhs.render(r)
+    r.putstr(",")
+    this.rhs.render(r)
+    r.putstr(")|0")
+  }
+})
+
+
+function F32Eqz(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(F32Eqz, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(!")
+    this.operand.render(r)
+    r.putstr(")|0")
+  }
+})
+
+
+function F32IsNaN(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(F32IsNaN, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f32_isNaN(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function F32UnaryOp(what, operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+  this.what = what
+}
+inherits(F32UnaryOp, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32(")
+    r.putstr(this.what)
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr("))")
+  }
+})
+
+function F32CompareOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(F32CompareOp, _BinaryOp, {
+  render: function render(r) {
+    // It's important to use fround() here so that
+    // boxed NaNs don't compare equal to themselves
+    r.putstr("(fround(")
+    this.lhs.render(r)
+    r.putstr(") ")
+    r.putstr(this.what)
+    r.putstr(" fround(")
+    this.rhs.render(r)
+    r.putstr("))|0")
+  }
+})
+
+function F32BinOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.F32, lhs, rhs)
+  this.what = what
+}
+inherits(F32BinOp, _BinaryOp, {
+  render: function render(r) {
+    // We can safely use fround() here because we're
+    // allowed to canonicalize NaNs \o/
+    r.putstr("fround((")
+    this.lhs.render(r)
+    r.putstr(")")
+    r.putstr(this.what)
+    r.putstr("(")
+    this.rhs.render(r)
+    r.putstr("))")
+  }
+})
+
+function F32BinFunc(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.F32, lhs, rhs)
+  this.what = what
+}
+inherits(F32BinFunc, _BinaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.lhs.render(r)
+    r.putstr(",")
+    this.rhs.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function F64Eqz(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(F64Eqz, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(!")
+    this.operand.render(r)
+    r.putstr(")|0")
+  }
+})
+
+
+function F64IsNaN(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(F64IsNaN, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f64_isNaN(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function F64UnaryOp(what, operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+  this.what = what
+}
+inherits(F64UnaryOp, _UnaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function F64CompareOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.I32, lhs, rhs)
+  this.what = what
+}
+inherits(F64CompareOp, _BinaryOp, {
+  render: function render(r) {
+    // It's important to cast values with `+` here so that
+    // boxed NaNs don't compare equal to themselves
+    r.putstr("(+(")
+    this.lhs.render(r)
+    r.putstr(") ")
+    r.putstr(this.what)
+    r.putstr(" (+(")
+    this.rhs.render(r)
+    r.putstr(")))|0")
+  }
+})
+
+function F64BinOp(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.F64, lhs, rhs)
+  this.what = what
+}
+inherits(F64BinOp, _BinaryOp, {
+  render: function render(r) {
+    r.putstr("(")
+    this.lhs.render(r)
+    r.putstr(")")
+    r.putstr(this.what)
+    r.putstr("(")
+    this.rhs.render(r)
+    r.putstr(")")
+  }
+})
+
+function F64BinFunc(what, lhs, rhs) {
+  _BinaryOp.call(this, TYPES.F64, lhs, rhs)
+  this.what = what
+}
+inherits(F64BinFunc, _BinaryOp, {
+  render: function render(r) {
+    r.putstr(this.what)
+    r.putstr("(")
+    this.lhs.render(r)
+    r.putstr(",")
+    this.rhs.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function Select(cond, trueExpr, falseExpr) {
+  _Expr.call(this, trueExpr.type)
+  this.cond = cond
+  this.trueExpr = trueExpr
+  this.falseExpr = falseExpr
+}
+inherits(Select, _Expr, {
+  render: function render(r) {
+    r.putstr("((")
+    this.cond.render(r)
+    r.putstr(") ? (")
+    this.trueExpr.render(r)
+    r.putstr(") : (")
+    this.falseExpr.render(r)
+    r.putstr("))")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.cond.walkConsumedVariables(cb)
+    this.trueExpr.walkConsumedVariables(cb)
+    this.falseExpr.walkConsumedVariables(cb)
+  }
+})
+
+
+function Call(typesig, index, args) {
+  if (typesig.return_types.length === 0) {
+    _Expr.call(this, TYPES.NONE)
+  } else {
+    _Expr.call(this, typesig.return_types[0])
+  }
+  this.typesig = typesig
+  this.index = index
+  this.args = args
+}
+inherits(Call, _Expr, {
+  render: function render(r) {
+    r.putstr("F")
+    r.putstr(this.index)
+    r.putstr("(")
+    if (this.args.length > 0) {
+      for (var i = 0; i < this.args.length - 1; i++) {
+        this.args[i].render(r)
+        r.putstr(",")
+      }
+      this.args[i].render(r)
+    }
+    r.putstr(")")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.args.forEach(function(arg) {
+      arg.walkConsumedVariables(cb)
+    })
+  }
+})
+
+
+function CallIndirect(typesig, index, args) {
+  if (typesig.return_types.length === 0) {
+    _Expr.call(this, TYPES.NONE)
+  } else {
+    _Expr.call(this, typesig.return_types[0])
+  }
+  this.typesig = typesig
+  this.index = index
+  this.args = args
+}
+inherits(CallIndirect, _Expr, {
+  render: function render(r) {
+    // XXX TODO: in some cases we could use asmjs type-specific function tables here.
+    // For now we just delegate to an externally-defined helper.
+    r.putstr("call_")
+    r.putstr(makeSigStr(this.typesig))
+    r.putstr("(")
+    this.index.render(r)
+    for (var i = 0; i < this.args.length; i++) {
+      r.putstr(",")
+      this.args[i].render(r)
+    }
+    r.putstr(")")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.index.walkConsumedVariables(cb)
+    this.args.forEach(function(arg) {
+      arg.walkConsumedVariables(cb)
+    })
+  }
+})
+
+
+function GetRawMemorySize(index) {
+  _Expr.call(this, TYPES.I32)
+  this.index = index
+}
+inherits(GetRawMemorySize, _Expr, {
+  render: function render(r) {
+    r.putstr("memorySize")
+  }
+})
+
+function GetMemorySize(index) {
+  _Expr.call(this, TYPES.I32)
+  this.index = index
+}
+inherits(GetMemorySize, _Expr, {
+  render: function render(r) {
+    r.putstr("(memorySize / ")
+    r.putstr(PAGE_SIZE)
+    r.putstr(")")
+  }
+})
+
+function GrowMemory(index, expr) {
+  _Expr.call(this, TYPES.I32)
+  this.index = index
+  this.expr = expr
+}
+inherits(GrowMemory, _Expr, {
+  render: function render(r) {
+    r.putstr("M")
+    r.putstr(this.index)
+    r.putstr("._grow(")
+    this.expr.render(r)
+    r.putstr(")")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.expr.walkConsumedVariables(cb)
+  }
+})
+
+
+function I32FromI64Low(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32FromI64Low, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(".low)")
+  }
+})
+
+function I32FromI64High(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32FromI64High, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(")
+    this.operand.render(r)
+    r.putstr(".high)")
+  }
+})
+
+function I32TruncF32S(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32TruncF32S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f32_trunc(")
+    this.operand.render(r)
+    r.putstr(")|0")
+  }
+})
+
+function I32TruncF64S(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32TruncF64S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f64_trunc(")
+    this.operand.render(r)
+    r.putstr(")|0")
+  }
+})
+
+function I32TruncF32U(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32TruncF32U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(f32_trunc(")
+    this.operand.render(r)
+    r.putstr(")|0)")
+  }
+})
+
+function I32TruncF64U(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32TruncF64U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(f64_trunc(")
+    this.operand.render(r)
+    r.putstr(")|0)")
+  }
+})
+
+function I32ReinterpretF32(operand) {
+  _UnaryOp.call(this, TYPES.I32, operand)
+}
+inherits(I32ReinterpretF32, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("i32_reinterpret_f32(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function I64FromI32S(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64FromI32S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("i64_from_i32_s(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function I64FromI32U(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64FromI32U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("(new Long(")
+    this.operand.render(r)
+    r.putstr(", 0))")
+  }
+})
+
+function I64From2xI32(high, low) {
+  _Expr.call(this, TYPES.I64)
+  this.high = high
+  this.low = low
+}
+inherits(I64From2xI32, _Expr, {
+  render: function render(r) {
+    r.putstr("(new Long(")
+    this.low.render(r)
+    r.putstr(",")
+    this.high.render(r)
+    r.putstr("))")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.high.walkConsumedVariables(cb)
+    this.low.walkConsumedVariables(cb)
+  }
+})
+
+
+function I64TruncF32S(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64TruncF32S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("Long.fromNumber(f32_trunc(")
+    this.operand.render(r)
+    r.putstr("))")
+  }
+})
+
+function I64TruncF64S(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64TruncF64S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("Long.fromNumber(f64_trunc(")
+    this.operand.render(r)
+    r.putstr("))")
+  }
+})
+
+function I64TruncF32U(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64TruncF32U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("Long.fromNumber(f32_trunc(")
+    this.operand.render(r)
+    r.putstr("), true).toSigned()")
+  }
+})
+
+function I64TruncF64U(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64TruncF64U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("Long.fromNumber(f64_trunc(")
+    this.operand.render(r)
+    r.putstr("), true).toSigned()")
+  }
+})
+
+function I64ReinterpretF64(operand) {
+  _UnaryOp.call(this, TYPES.I64, operand)
+}
+inherits(I64ReinterpretF64, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("i64_reinterpret_f64(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function F32FromI32S(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32FromI32S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32((")
+    this.operand.render(r)
+    r.putstr(")|0)")
+  }
+})
+
+function F32FromI32U(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32FromI32U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32((")
+    this.operand.render(r)
+    r.putstr(")>>>0)")
+  }
+})
+
+function F32FromI64S(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32FromI64S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32(")
+    this.operand.render(r)
+    r.putstr(".toNumber())")
+  }
+})
+
+function F32FromI64U(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32FromI64U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32(")
+    this.operand.render(r)
+    r.putstr(".toUnsigned().toNumber())")
+  }
+})
+
+function F32FromF64(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32FromF64, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("ToF32(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function F32ReinterpretI32(operand) {
+  _UnaryOp.call(this, TYPES.F32, operand)
+}
+inherits(F32ReinterpretI32, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f32_reinterpret_i32(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function F64FromI32S(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64FromI32S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("+((")
+    this.operand.render(r)
+    r.putstr(")|0)")
+  }
+})
+
+function F64FromI32U(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64FromI32U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("+((")
+    this.operand.render(r)
+    r.putstr(")>>>0)")
+  }
+})
+
+function F64FromI64S(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64FromI64S, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("+(")
+    this.operand.render(r)
+    r.putstr(".toNumber())")
+  }
+})
+
+function F64FromI64U(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64FromI64U, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("+(")
+    this.operand.render(r)
+    r.putstr(".toUnsigned().toNumber())")
+  }
+})
+
+function F64FromF32(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64FromF32, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("+(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+function F64ReinterpretI64(operand) {
+  _UnaryOp.call(this, TYPES.F64, operand)
+}
+inherits(F64ReinterpretI64, _UnaryOp, {
+  render: function render(r) {
+    r.putstr("f64_reinterpret_i64(")
+    this.operand.render(r)
+    r.putstr(")")
+  }
+})
+
+
+//
+// Classes to represent various kinds of *statement*.
+// Statements are immediately executed rather than manaed on a stack,
+// and they consume expressions.
+//
+
+
+function _Stmt() {
+}
+inherits(_Stmt, Object, {
+  render: function render(r) {
+    throw new CompileError('not implemented')
+  },
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+  }
+})
+
+
+function _UnaryStmt(expr) {
+  _Stmt.call(this)
+  this.expr = expr
+}
+inherits(_UnaryStmt, _Stmt, {
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.expr.walkConsumedVariables(cb)
+  }
+})
+
+
+function Debug(msg) {
+  _Stmt.call(this)
+  this.msg = msg
+  this.exprs = []
+  for (var i = 1; i < arguments.length; i++) {
+    this.exprs.push(arguments[i])
+  }
+}
+inherits(Debug, _Stmt, {
+  render: function render(r) {
+    r.putstr("WebAssembly._dump('")
+    r.putstr(this.msg)
+    r.putstr("'")
+    for (var i = 0; i < this.exprs.length; i++) {
+      r.putstr(",")
+      this.exprs[i].render(r)
+    }
+    r.putstr(")\n")
+  }
+})
+
+function Drop(expr) {
+  _UnaryStmt.call(this, expr)
+}
+inherits(Drop, _UnaryStmt, {
+  render: function render(r) {
+    // XXX TODO: emit only the side-effects of the given expr,
+    // but don't actually execute the entire thing?
+    r.putstr("void (")
+    this.expr.render(r)
+    r.putstr(")")
+  }
+})
+
+
+function Branch(cf, result) {
+  _Stmt.call(this)
+  this.cf = cf
+  this.result = result
+  cf.prepareIncomingBranch(this)
+}
+inherits(Branch, _Stmt, {
+  render: function render(r) {
+    this.cf.renderIncomingBranch(r, this.result)
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    if (this.result) {
+      this.result.walkConsumedVariables(cb)
+    }
+  }
+})
+
+
+function BranchIf(cond, cf, result) {
+  _Stmt.call(this)
+  this.cond = cond
+  this.cf = cf
+  this.result = result
+  cf.prepareIncomingBranch(this)
+}
+inherits(BranchIf, _Stmt, {
+  render: function render(r) {
+    r.putstr("if (")
+    this.cond.render(r)
+    r.putstr(") {")
+    this.cf.renderIncomingBranch(r, this.result)
+    r.putstr("}")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.cond.walkConsumedVariables(cb)
+    // We do *not* consume variables in the result,
+    // they remain on the stack if the condition is false.
+  }
+})
+
+
+function BranchTable(expr, default_cf, target_cfs, result) {
+  _Stmt.call(this)
+  this.expr = expr
+  this.default_cf = default_cf
+  this.target_cfs = target_cfs
+  this.result = result
+  default_cf.prepareIncomingBranch(this)
+  target_cfs.forEach(function(cf) {
+    cf.prepareIncomingBranch(this)
+  })
+}
+inherits(BranchTable, _Stmt, {
+  render: function render(r, parent) {
+    var self = this
+    r.putstr("switch (")
+    this.expr.render(r)
+    r.putstr(") {\n")
+    this.target_cfs.forEach(function(cf, idx) {
+      parent.renderIndent(r, 1)
+      r.putstr("case ")
+      r.putstr(idx)
+      r.putstr(": ")
+      cf.renderIncomingBranch(r, self.result)
+      r.putstr("\n")
+    })
+    parent.renderIndent(r, 1)
+    r.putstr("default: ")
+    this.default_cf.renderIncomingBranch(r, this.result)
+    r.putstr("\n")
+    parent.renderIndent(r)
+    r.putstr("}")
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.expr.walkConsumedVariables(cb)
+    if (this.result) {
+      this.result.walkConsumedVariables(cb)
+    }
+  }
+})
+
+
+function _SetVar(type, index, expr) {
+  _UnaryStmt.call(this, expr)
+  this.type = type
+  this.index = index
+}
+inherits(_SetVar, _UnaryStmt, {
+  render: function render(r) {
+    switch(this.type) {
+      case TYPES.I32:
+        r.putstr(this.namePrefix)
+        r.putstr("i")
+        r.putstr(this.index)
+        r.putstr(" = (")
+        this.expr.render(r)
+        r.putstr(")|0")
+        break
+      case TYPES.I64:
+        r.putstr(this.namePrefix)
+        r.putstr("l")
+        r.putstr(this.index)
+        r.putstr(" = ")
+        this.expr.render(r)
+        break
+      case TYPES.F32:
+        r.putstr(this.namePrefix)
+        r.putstr("f")
+        r.putstr(this.index)
+        r.putstr(" = ")
+        this.expr.render(r)
+        break
+      case TYPES.F64:
+        r.putstr(this.namePrefix)
+        r.putstr("d")
+        r.putstr(this.index)
+        r.putstr(" = ")
+        this.expr.render(r)
+        break
+      default:
+        throw new CompileError("unexpected type for setvar: " + this.type)
+    }
+  }
+})
+
+
+function SetTempVar(type, index, expr) {
+  _SetVar.call(this, type, index, expr)
+}
+inherits(SetTempVar, _SetVar, {
+  namePrefix: "t"
+})
+
+
+function SetLocal(type, index, expr) {
+  _SetVar.call(this, type, index, expr)
+}
+inherits(SetLocal, _SetVar, {
+  namePrefix: "l"
+})
+
+
+function SetGlobal(type, index, expr) {
+  _SetVar.call(this, type, index, expr)
+}
+inherits(SetGlobal, _SetVar, {
+  namePrefix: "G"
+})
+
+
+function _Store(type, value, addr, offset, size, flags) {
+  _Stmt.call(this)
+  this.type = type
+  this.value = value
+  this.addr = addr
+  this.offset = offset
+  this.flags = flags
+}
+inherits(_Store, _Stmt, {
+  renderUnaligned: function renderUnaligned(r, func) {
+    r.putstr(func)
+    r.putstr("((")
+    this.addr.render(r)
+    r.putstr(") + ")
+    r.putstr(this.offset)
+    r.putstr(",")
+    this.value.render(r)
+    r.putstr(")")
+  },
+
+  renderMaybeAligned: function renderMaybeAligned(r, mask, shift, ta, fallback) { 
+    if (! isLittleEndian) {
+      this.renderUnaligned(r, fallback)
+    } else {
+      r.putstr("if (((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(") & ")
+      r.putstr(mask)
+      r.putstr(") { ")
+      r.putstr(fallback) 
+      r.putstr("((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(",")
+      this.value.render(r)
+      r.putstr(") } else { ")
+      r.putstr(ta)
+      r.putstr("[((")
+      this.addr.render(r)
+      r.putstr(") + ")
+      r.putstr(this.offset)
+      r.putstr(")>>")
+      r.putstr(shift)
+      r.putstr("] = ")
+      this.value.render(r)
+      r.putstr("}")
+    }
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    this.addr.walkConsumedVariables(cb)
+    this.value.walkConsumedVariables(cb)
+  }
+})
+
+function I32Store(value, addr, offset, flags) {
+  _Store.call(this, TYPES.I32, value, addr, offset, 4, flags)
+}
+inherits(I32Store, _Store, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+      case 1:
+        this.renderUnaligned(r, "i32_store_unaligned")
+        break
+      case 2:
+        this.renderMaybeAligned(r, "0x03", "2", "HI32", "i32_store_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported store flags")
+    }
+  }
+})
+
+function F32Store(value, addr, offset, flags) {
+  _Store.call(this, TYPES.F32, value, addr, offset, 4, flags)
+}
+inherits(F32Store, _Store, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+      case 1:
+        this.renderUnaligned(r, "f32_store_unaligned")
+        break
+      case 2:
+        this.renderMaybeAligned(r, "0x03", "2", "HF32", "f32_store_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported store flags")
+    }
+    if (! isNaNPreserving32) {
+      r.putstr("; if (f32_isNaN(")
+      this.value.render(r)
+      r.putstr(")) { f32_store_nan_bitpattern(")
+      this.value.render(r)
+      r.putstr(",(")
+      this.addr.render(r)
+      r.putstr(")+")
+      r.putstr(this.offset)
+      r.putstr(") }")
+    }
+  }
+})
+
+function F64Store(value, addr, offset, flags) {
+  _Store.call(this, TYPES.F64, value, addr, offset, 8, flags)
+}
+inherits(F64Store, _Store, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+      case 1:
+      case 2:
+        this.renderUnaligned(r, "f64_store_unaligned")
+        break
+      case 3:
+        this.renderMaybeAligned(r, "0x07", "3", "HF64", "f64_store_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported store flags")
+    }
+    if (! isNaNPreserving64) {
+      r.putstr("; if (f64_isNaN(")
+      this.value.render(r)
+      r.putstr(")) { f64_store_nan_bitpattern(")
+      this.value.render(r)
+      r.putstr(",(")
+      this.addr.render(r)
+      r.putstr(")+")
+      r.putstr(this.offset)
+      r.putstr(") }")
+    }
+  }
+})
+
+
+function I32Store8(value, addr, offset, flags) {
+  _Store.call(this, TYPES.I32, value, addr, offset, 1, flags)
+}
+inherits(I32Store8, _Store, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        r.putstr("HU8[(")
+        this.addr.render(r)
+        r.putstr(")+")
+        r.putstr(this.offset)
+        r.putstr("] = ")
+        this.value.render(r)
+        break
+      default:
+        throw new CompileError("unsupported store flags")
+    }
+  }
+})
+
+
+function I32Store16(value, addr, offset, flags) {
+  _Store.call(this, TYPES.I32, value, addr, offset, 2, flags)
+}
+inherits(I32Store16, _Store, {
+  render: function render(r) {
+    switch (this.flags) {
+      case 0:
+        this.renderUnaligned(r, "i32_store16_unaligned")
+        break
+      case 1:
+        this.renderMaybeAligned(r, "0x01", "1", "HI16", "i32_store16_unaligned")
+        break
+      default:
+        throw new CompileError("unsupported store flags")
+    }
+  }
+})
+
+
+function Unreachable() {
+  _Stmt.call(this)
+}
+inherits(Unreachable, _Stmt, {
+  render: function render(r) {
+    r.putstr("trap('unreachable')\n")
+  }
+})
+
+
+function TrapConditions(exprs) {
+  _Stmt.call(this)
+  this.exprs = exprs
+}
+inherits(TrapConditions, _Stmt, {
+  render: function render(r, parent) {
+    r.putstr("if (")
+    this.exprs[0].render(r)
+    r.putstr(") { trap() }")
+    for (var i = 1; i < this.exprs.length; i++) {
+      r.putstr("\n")
+      parent.renderIndent(r)
+      r.putstr("if (")
+      this.exprs[i].render(r)
+      r.putstr(") { trap() }")
+    }
+  },
+
+  walkConsumedVariables: function walkConsumedVariables(cb) {
+    // Trap conditions do not consume any variables,
+    // we leave them live for the operations to follow.
+  }
+})
+
+
+//
+// Finally, and most importantly, we have the complex types of statement
+// that form our control structures.  These are the thing that that get
+// pushed and popped on the ControlFlowStack while we're translating the
+// function code.
+//
+
+function ControlFlowStructure(resultType) {
+  _Stmt.call(this)
+  this.resultType = resultType
+  this.branchResultType = resultType
+  this.stack = []
+  this.statements = []
+  this.pendingTrapConditions = []
+}
+inherits(ControlFlowStructure, _Stmt, {
+
+  initialize: function initialize(index, parent, tempvars) {
+    this.index = index
+    this.label = "L" + index
+    this.isPolymorphic = false
+    this.endReached = false
+    this.isDead = parent ? parent.isDead : false
+    this.tempvars = tempvars
+    this.resultVar = null
+  },
+
+  getResultVar: function getResultVar() {
+    if (this.resultVar === null) {
+      if (this.resultType === TYPES.NONE) {
+        throw new CompileError("no result var for NONE block")
+      }
+      this.resultVar = this.acquireTempVar(this.resultType)
+    }
+    return this.resultVar
+  },
+
+  markDeadCode: function markDeadCode() {
+    this.isDead = true
+    this.isPolymorphic = true
+    // If there are unconsumed values on the stack, we have to evaluate them
+    // in order to ensure any side-effects are performed.
+    for (var i = 0; i < this.stack.length; i++) {
+      this._pushStatement(new Drop(this.stack[i]))
+    }
+    this.stack = []
+  },
+
+  addStatement: function addStatement(stmt) {
+    this.finalizeTrapConditions()
+    this._pushStatement(stmt)
+  },
+
+  addTerminalStatement: function addTerminalStatement(stmt) {
+    this.finalizeTrapConditions()
+    this.markDeadCode()
+    this._pushStatement(stmt)
+  },
+
+  _pushStatement: function _pushStatement(stmt) {
+    var self = this
+    // Any tempvars consumed by the statement are now free to be re-used.
+    stmt.walkConsumedVariables(function (v) {
+      if (v instanceof GetTempVar) {
+        self.releaseTempVar(v.type, v.index)
+      }
+    })
+    this.statements.push(stmt)
+  },
+
+  pushValue: function pushValue(value) {
+    switch (value.type) {
+      case TYPES.I32:
+      case TYPES.I64:
+      case TYPES.F32:
+      case TYPES.F64:
+        this.stack.push(value)
+        break
+      case TYPES.UNKNOWN:
+        if (! this.isPolymorphic) {
+          throw new CompileError("pushing value of unknown type: " + JSON.stringify(value))
+        }
+        break
+      default:
+        throw new CompileError("pushing unexpected value: " + JSON.stringify(value))
+    }
+    return value
+  },
+
+  peekType: function peekType() {
+    if (this.stack.length === 0) {
+      if (! this.isPolymorphic) {
+        throw new CompileError("nothing on the stack")
+      }
+      return TYPES.UNKNOWN
+    }
+    return this.stack[this.stack.length - 1].type
+  },
+
+  peekValue: function peekValue(wantType) {
+    if (this.stack.length === 0) {
+      if (! this.isPolymorphic) {
+        throw new CompileError("nothing on the stack")
+      }
+      return new Undefined()
+    }
+    var value = this.stack[this.stack.length - 1]
+    wantType = wantType || TYPES.UNKNOWN
+    if (wantType !== TYPES.UNKNOWN && value.type !== wantType && value.type !== TYPES.UNKNOWN) {
+      if (! this.isPolymorphic) {
+        throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + value.type)
+      }
+      return new Undefined()
+    }
+    return value
+  },
+
+  popValue: function popValue(wantType) {
+    if (this.stack.length === 0) {
+      if (! this.isPolymorphic) {
+        throw new CompileError("nothing on the stack")
+      }
+      return new Undefined()
+    }
+    var value = this.stack.pop()
+    if (wantType !== TYPES.UNKNOWN && value.type !== wantType && value.type !== TYPES.UNKNOWN) {
+      if (! this.isPolymorphic) {
+        throw new CompileError("Stack type mismatch: expected " + wantType + ", found " + value.type)
+      }
+      return new Undefined()
+    }
+    return value
+  },
+
+  spillValue: function spillValue() {
+    if (this.stack.length > 0) {
+      var value = this.stack[this.stack.length - 1]
+      if (! (value instanceof GetTempVar) && ! (value instanceof _Constant)) {
+        var varNum = this.acquireTempVar(value.type)
+        this._pushStatement(new SetTempVar(value.type, varNum, value))
+        this.stack[this.stack.length - 1] = new GetTempVar(value.type, varNum)
+      }
+      return this.stack[this.stack.length - 1]
+    }
+  },
+
+  spillAllValues: function spillAllValues() {
+    for (var i = 0; i < this.stack.length; i++) {
+      var value = this.stack[i]
+      if (! (value instanceof GetTempVar) && ! (value instanceof _Constant)) {
+        var varNum = this.acquireTempVar(value.type)
+        this._pushStatement(new SetTempVar(value.type, varNum, value))
+        this.stack[i] = new GetTempVar(value.type, varNum)
+      }
+    }
+  },
+
+  acquireTempVar: function acquireTempVar(typ) {
+    var tvs = this.tempvars[typ]
+    if (tvs.free.length > 0) {
+      return tvs.free.pop()
+    }
+    return tvs.count++
+  },
+
+  releaseTempVar: function releaseTempVar(typ, num) {
+    this.tempvars[typ].free.push(num)
+  },
+
+  // XXX TODO: this is where we want to try to merge trap conditions,
+  // but it's probably going to be complicated.  For example, if we
+  // have multiple bounds checks on the same variable, merge them into
+  // a single check.
+  //
+  // I've got two broad ideas, neither of which is implemented yet:
+  //
+  //  * Avoid emitting trap conditions until the point where we must
+  //    observe their side-effects.  Instead, collect them in memory
+  //    and coalesce them when possible.
+  //
+  //  * After emitting a trap condition, maintain information about
+  //    what it asserts and use that to avoid redundant future checks.
+  //    For example, if we emit a trap condition saying "li0 < 20",
+  //    then we should remember that fact until we emit a statement
+  //    what will change the value of li0.
+
+  addTrapCondition: function addTrapCondition(expr) {
+    this.pendingTrapConditions.push(expr)
+  },
+
+  finalizeTrapConditions: function finalizeTrapConditions() {
+    if (this.pendingTrapConditions.length > 0) {
+      this._pushStatement(new TrapConditions(this.pendingTrapConditions))
+      this.pendingTrapConditions = []
+    }
+  },
+
+  render: function render(r) {
+    var self = this
+    this.statements.forEach(function(stmt) {
+      self.renderIndent(r)
+      stmt.render(r, self)
+      r.putstr("\n")
+    })
+  },
+
+  renderIndent: function renderIndent(r, extra) {
+    var indent = this.index + 1 + (extra|0)
+    while (indent > 0) {
+      r.putstr("  ")
+      indent--
+    }
+  },
+
+  markEndOfBlock: function markEndOfBlock() {
+    if (! this.isDead) {
+      this.finalizeTrapConditions()
+      this.endReached = true
+      if (this.resultType !== TYPES.NONE) {
+        var result = this.popValue(this.resultType)
+        this.addStatement(new SetTempVar(this.resultType, this.getResultVar(), result))
+      }
+      if (this.stack.length > 0) {
+        throw new CompileError("block left extra values on the stack")
+      }
+    }
+  },
+
+  switchToElseBranch: function switchToElseBranch() {
+    throw new CompileError("mis-placed ELSE")
+  },
+
+  prepareIncomingBranch: function prepareIncomingBranch(stmt) {
+    this.endReached = true
+  }
+})
+
+// Function Body
+
+function FunctionBody(resultType) {
+  ControlFlowStructure.call(this, resultType)
+  this.returnValue = null
+}
+inherits(FunctionBody, ControlFlowStructure, {
+
+  markEndOfBlock: function markEndOfBlock() {
+    if (! this.isDead) {
+      this.finalizeTrapConditions()
+      this.endReached = true
+      if (this.resultType !== TYPES.NONE) {
+        this.returnValue = this.popValue(this.resultType)
+      }
+      if (this.stack.length > 0) {
+         throw new CompileError("function left extra values on the stack")
+      }
+    }
+  },
+
+  render: function render(r) {
+    ControlFlowStructure.prototype.render.call(this, r)
+    if (this.resultType !== TYPES.NONE && ! this.isDead) {
+      this.renderIndent(r)
+      r.putstr("return ")
+      this.returnValue.render(r)
+      r.putstr("\n")
+    }
+  },
+
+  renderIncomingBranch: function renderIncomingBranch(r, result) {
+    r.putstr("return")
+    if (this.branchResultType !== TYPES.NONE) {
+      r.putstr(" ")
+      result.render(r)
+    }
+  }
+})
+
+
+// Loop
+
+function Loop(resultType) {
+  ControlFlowStructure.call(this, resultType)
+  this.branchResultType = TYPES.NONE
+}
+inherits(Loop, ControlFlowStructure, {
+  render: function render(r) {
+    r.putstr(this.label)
+    r.putstr(": while(1) {\n")
+    ControlFlowStructure.prototype.render.call(this, r)
+    this.renderIndent(r)
+    r.putstr("break")
+    this.renderIndent(r, -1)
+    r.putstr("}")
+  },
+
+  renderIncomingBranch: function renderIncomingBranch(r, result) {
+    if (result) {
+      throw new CompileError("cant branch to Loop with a result")
+    }
+    r.putstr("continue ")
+    r.putstr(this.label)
+  }
+})
+
+
+// Block
+
+function Block(resultType) {
+  ControlFlowStructure.call(this, resultType)
+}
+inherits(Block, ControlFlowStructure, {
+  render: function render(r) {
+    r.putstr(this.label)
+    r.putstr(": do {\n")
+    ControlFlowStructure.prototype.render.call(this, r)
+    this.renderIndent(r, -1)
+    r.putstr("} while(0)")
+  },
+
+  prepareIncomingBranch: function prepareIncomingBranch(stmt) {
+    if (this.branchResultType !== TYPES.NONE) {
+      this.getResultVar()
+    }
+    ControlFlowStructure.prototype.prepareIncomingBranch.call(this, stmt)
+  },
+
+  renderIncomingBranch: function renderIncomingBranch(r, result) {
+    if (this.branchResultType !== TYPES.NONE) {
+      var stmt = new SetTempVar(this.resultType, this.getResultVar(), result)
+      stmt.render(r)
+      r.putstr("; ")
+    }
+    r.putstr("break ")
+    r.putstr(this.label)
+  }
+})
+
+// IfElse
+
+function IfElse(resultType, condExpr) {
+  ControlFlowStructure.call(this, resultType)
+  this.condExpr = condExpr
+  this.trueBranch = this.statements
+  this.elseBranch = []
+  this.startedOutDead = false
+  this.trueBranchGoesDead = false
+  this.elseBranchGoesDead = false
+}
+inherits(IfElse, Block, {
+
+  initialize: function initialize(index, parent, tempvars) {
+    ControlFlowStructure.prototype.initialize.call(this, index, parent, tempvars)
+    this.startedOutDead = this.isDead
+  },
+
+  switchToElseBranch: function switchToElseBranch() {
+    Block.prototype.markEndOfBlock.call(this)
+    this.trueBranchGoesDead = this.isDead
+    this.isDead = this.startedOutDead
+    this.isPolymorphic = false
+    this.statements = this.elseBranch
+  },
+
+  markEndOfBlock: function markEndOfBlock() {
+    Block.prototype.markEndOfBlock.call(this)
+    if (this.statements === this.elseBranch) {
+      this.elseBranchGoesDead = this.isDead
+      this.isDead = this.trueBranchGoesDead && this.elseBranchGoesDead
+    } else {
+      this.endReached = true
+      this.isDead = this.startedOutDead
+    }
+  },
+
+  render: function render(r) {
+    r.putstr("if (")
+    this.condExpr.render(r)
+    r.putstr(") { ")
+    this.statements = this.trueBranch
+    Block.prototype.render.call(this, r)
+    if (this.elseBranch.length > 0) {
+      r.putstr("} else { ")
+      this.statements = this.elseBranch
+      Block.prototype.render.call(this, r)
+    }
+    r.putstr(" }")
+  }
+})

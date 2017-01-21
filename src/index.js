@@ -21,7 +21,7 @@ import Memory from "./Memory"
 import translate from "./translate/index"
 import { compileAsync, compileSync} from "./compile"
 import { CompileError, LinkError, RuntimeError } from "./errors"
-import { dump, _fromNaNBytes } from "./utils"
+import { dump, _toBoxedNaN } from "./utils"
 
 
 export default WebAssembly
@@ -41,7 +41,7 @@ var WebAssembly = {
   // Some private things for our own convenience
   _Long: Long,
   _translate: translate,
-  _fromNaNBytes: _fromNaNBytes,
+  _toBoxedNaN: _toBoxedNaN,
   _dump: dump
 }
 

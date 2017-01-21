@@ -12,22 +12,20 @@
 //    It might be fun to try to write a smaller version with just
 //    the bits we need, implemented directly in these helper functions.
 //
-//  * The float32 functions have a lot of mucking around with NaNs.
-//    WASM requires that we preserve specific bit patterns in NaNs
-//    and as far as I can tell, JavaScript doesn't do this reliably.
-//    In particular, if you write a 32-bit float to an ArrayBuffer
-//    and read it back, it will be converted from signalling to
-//    non-signalling.
-//
-//    We work around this for now by boxing NaNs into a Number object
-//    and setting a separte flag, but that's very hacking and I'm sure
-//    very slow.  It would be great to find a better way...
+//  * WASM requires that we preserve specific bit patterns in NaNs,
+//    but JavaScript engines are not required to do this reliably.
+//    We work around this by boxing NaNs into a Number() and storing
+//    the bitpattern as integer properties on that object.
 //
 
 import Long from "long"
 
 import { RuntimeError } from "./errors"
-import { dump, _fromNaNBytes } from "./utils"
+import {
+  dump,
+  isNaNPreserving32,
+  isNaNPreserving64
+} from "./utils"
 
 export default stdlib
 
@@ -38,6 +36,46 @@ var stdlib = {}
 var scratchBuf = new ArrayBuffer(8)
 var scratchBytes = new Uint8Array(scratchBuf)
 var scratchData = new DataView(scratchBuf)
+
+// Helpers for working with boxed NaNs in scratch space.
+
+function f32_scratchWrite(v) {
+  if (typeof v === 'object' && v._wasmBitPattern) {
+    scratchData.setInt32(0, v._wasmBitPattern, true)
+  } else {
+    scratchData.setFloat32(0, v, true)
+  }
+}
+
+function f32_scratchLoad() {
+  var res = scratchData.getFloat32(0, true)
+  if (! isNaNPreserving32 && isNaN(res)) {
+    res = new Number(res)
+    res._wasmBitPattern = scratchData.getInt32(0, true)
+  }
+  return res
+}
+
+function f64_scratchWrite(v) {
+  if (typeof v === 'object' && v._wasmBitPattern) {
+    scratchData.setInt32(0, v._wasmBitPattern.low, true)
+    scratchData.setInt32(4, v._wasmBitPattern.high, true)
+  } else {
+    scratchData.setFloat64(0, v, true)
+  }
+}
+
+function f64_scratchLoad(v) {
+  var res = scratchData.getFloat64(0, true)
+  if (! isNaNPreserving64 && isNaN(res)) {
+    res = new Number(res)
+    res._wasmBitPattern = new Long(
+      scratchData.getInt32(0, true),
+      scratchData.getInt32(4, true)
+    )
+  }
+  return res
+}
 
 // Helpful constants.
 stdlib.INT32_MIN = 0x80000000|0
@@ -75,10 +113,12 @@ stdlib.i32_popcnt = function(v) {
   return count
 }
 stdlib.i32_reinterpret_f32 = function(v) {
-  scratchData.setFloat32(0, v, true)
-  if (typeof v === 'object' && v._signalling) {
-    scratchBytes[2] &= ~0x40
+  if (isNaN(v) && typeof v === 'object' && v._wasmBitPattern) {
+    //console.log("REINTERPRETED", v, v._wasmBitPattern)
+    return v._wasmBitPattern
   }
+  scratchData.setFloat32(0, v, true)
+  //console.log("REINTERPRETED", v, scratchData.getInt32(0, true))
   return scratchData.getInt32(0, true)
 }
 
@@ -126,19 +166,31 @@ stdlib.i64_popcnt = function(v) {
   return Long.fromNumber(stdlib.i32_popcnt(v.getHighBits()) + stdlib.i32_popcnt(v.getLowBits()))
 }
 stdlib.i64_reinterpret_f64 = function(v) {
+  if (isNaN(v) && typeof v === 'object' && v._wasmBitPattern) {
+    return v._wasmBitPattern
+  }
   scratchData.setFloat64(0, v, true)
   var low = scratchData.getInt32(0, true)
   var high = scratchData.getInt32(4, true)
   return new Long(low, high)
 }
+stdlib.i64_from_i32_s = function(v) {
+  // Sign-extend into 64 bits.
+  if (v & 0x80000000) {
+    return new Long(v, -1)
+  } else {
+    return new Long(v, 0)
+  }
+}
 
 // f32 operations
 stdlib.ToF32 = function (v) {
-  if (isNaN(v) && typeof v === 'object') {
+  if (isNaN(v) && typeof v === 'object' && typeof v._wasmBitPattern === 'number') {
     return v
   }
   return Math.fround(v)
 }
+stdlib.f32_isNaN = isNaN
 stdlib.f32_min = Math.min
 stdlib.f32_max = Math.max
 stdlib.f32_sqrt = Math.sqrt
@@ -152,37 +204,28 @@ stdlib.f32_nearest = function (v) {
 }
 stdlib.f32_abs = function (v) {
   if (isNaN(v)) {
-    scratchData.setFloat32(0, v, true)
+    f32_scratchWrite(v)
     scratchBytes[3] &= ~0x80
-    var res = scratchData.getFloat32(0, true)
-    if (typeof v === 'object' && v._signalling) {
-      res = new Number(res)
-      res._signalling = true
-    }
-    return res
+    return f32_scratchLoad()
   }
   return Math.abs(v)
 }
 stdlib.f32_neg = function (v) {
   if (isNaN(v)) {
-    scratchData.setFloat32(0, v, true)
+    f32_scratchWrite(v)
     if (scratchBytes[3] & 0x80) {
       scratchBytes[3] &= ~0x80
     } else {
       scratchBytes[3] |= 0x80
     }
-    var res = scratchData.getFloat32(0, true)
-    if (typeof v === 'object' && v._signalling) {
-      res = new Number(res)
-      res._signalling = true
-    }
+    return f32_scratchLoad()
     return res
   }
   return -v
 }
 stdlib.f32_signof = function(v) {
   if (isNaN(v)) {
-    scratchData.setFloat32(0, v, true)
+    f32_scratchWrite(v)
     return (scratchBytes[3] & 0x80) ? -1 : 1
   }
   return (v > 0 || 1 / v > 0) ? 1 : -1
@@ -190,34 +233,23 @@ stdlib.f32_signof = function(v) {
 stdlib.f32_copysign = function (x, y) {
   var sign = stdlib.f32_signof(y)
   if (isNaN(x)) {
-    scratchData.setFloat32(0, x, true)
+    f32_scratchWrite(x)
     if (sign === -1) {
       scratchBytes[3] |= 0x80
     } else {
       scratchBytes[3] &= ~0x80
     }
-    var v = scratchData.getFloat32(0, true)
-    if (typeof x === 'object' && x._signalling) {
-      v = new Number(v)
-      v._signalling = true
-    }
-    return v
+    return f32_scratchLoad()
   }
   return sign * Math.abs(x)
 }
 stdlib.f32_reinterpret_i32 = function(v) {
   scratchData.setInt32(0, v, true)
-  var v = scratchData.getFloat32(0, true)
-  if (isNaN(v)) {
-    if (!(scratchBytes[2] & 0x40)) {
-      v = new Number(v)
-      v._signalling = true
-    }
-  }
-  return v
+  return f32_scratchLoad()
 }
 
 // f64 operations
+stdlib.f64_isNaN = isNaN
 stdlib.f64_min = Math.min
 stdlib.f64_max = Math.max
 stdlib.f64_sqrt = Math.sqrt
@@ -227,27 +259,27 @@ stdlib.f64_trunc = Math.trunc
 stdlib.f64_nearest = stdlib.f32_nearest
 stdlib.f64_abs = function (v) {
   if (isNaN(v)) {
-    scratchData.setFloat64(0, v, true)
+    f64_scratchWrite(v)
     scratchBytes[7] &= ~0x80
-    return scratchData.getFloat64(0, true)
+    return f64_scratchLoad()
   }
   return Math.abs(v)
 }
 stdlib.f64_neg = function (v) {
   if (isNaN(v)) {
-    scratchData.setFloat64(0, v, true)
+    f64_scratchWrite(v)
     if (scratchBytes[7] & 0x80) {
       scratchBytes[7] &= ~0x80
     } else {
       scratchBytes[7] |= 0x80
     }
-    return scratchData.getFloat64(0, true)
+    return f64_scratchLoad()
   }
   return -v
 }
 stdlib.f64_signof = function(v) {
   if (isNaN(v)) {
-    scratchData.setFloat64(0, v, true)
+    f64_scratchWrite(v)
     return (scratchBytes[7] & 0x80) ? -1 : 1
   }
   return (v > 0 || 1 / v > 0) ? 1 : -1
@@ -255,18 +287,18 @@ stdlib.f64_signof = function(v) {
 stdlib.f64_copysign = function (x, y) {
   var sign = stdlib.f64_signof(y)
   if (isNaN(x)) {
-    scratchData.setFloat64(0, x, true)
+    f64_scratchWrite(x)
     if (sign === -1) {
       scratchBytes[7] |= 0x80
     } else {
       scratchBytes[7] &= ~0x80
     }
-    return scratchData.getFloat64(0, true)
+    return f64_scratchLoad()
   }
   return sign * Math.abs(x)
 }
 stdlib.f64_reinterpret_i64 = function(v) {
   scratchData.setInt32(0, v.low, true)
   scratchData.setInt32(4, v.high, true)
-  return scratchData.getFloat64(0, true)
+  return f64_scratchLoad()
 }

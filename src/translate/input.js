@@ -8,6 +8,7 @@
 import Long from "long"
 
 import { CompileError } from "../errors"
+import { isNaNPreserving32, isNaNPreserving64 } from "../utils"
 
 
 export default function InputStream(bytes) {
@@ -170,17 +171,9 @@ InputStream.prototype.read_varint64 = function read_varint64() {
 InputStream.prototype.read_float32 = function read_float32() {
   var dv = new DataView(this.bytes.buffer)
   var v = dv.getFloat32(this.idx, true)
-  // XXX TODO: is it possible to preserve the signalling bit of a NaN?
-  // They don't seem to round-trip properly.  For now, we box them to
-  // ensure that we can read the signalling bit back later.
-  if (isNaN(v)) {
-    if (!(this.bytes[this.idx+2] & 0x40)) {
-      // Remebmer that it was a signalling NaN.
-      // This boxing will be lost when you operate on it, but
-      // we can preserve it for long enough to get tests to pass.
-      v = new Number(v)
-      v._signalling = true
-    }
+  if (isNaN(v) && ! isNaNPreserving32) {
+    v = new Number(v)
+    v._wasmBitPattern = dv.getInt32(this.idx, true)
   }
   this.idx += 4
   return v
@@ -189,6 +182,13 @@ InputStream.prototype.read_float32 = function read_float32() {
 InputStream.prototype.read_float64 = function read_float64() {
   var dv = new DataView(this.bytes.buffer)
   var v = dv.getFloat64(this.idx, true)
+  if (isNaN(v) && ! isNaNPreserving64) {
+    v = new Number(v)
+    v._wasmBitPattern = new Long(
+       dv.getInt32(this.idx, true),
+       dv.getInt32(this.idx + 4, true)
+    )
+  }
   this.idx += 8
   return v
 }

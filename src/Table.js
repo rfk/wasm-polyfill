@@ -5,7 +5,7 @@
 // JavaScript array.
 //
 
-import { RuntimeError } from "./errors"
+import { LinkError, RuntimeError } from "./errors"
 import {
   assertIsDefined,
   assertIsInstance,
@@ -88,7 +88,7 @@ Table.prototype._setmany = function _setmany(start, values) {
   assertIsInstance(this, Table)
   start = ToNonWrappingUint32(start)
   if ((start + values.length) > this._internals.values.length) {
-    throw TypeError("table set out of bounds")
+    throw new LinkError("table set out of bounds")
   }
   for (var i = 0; i < values.length; i++) {
     this._internals.values[start + i] = values[i]

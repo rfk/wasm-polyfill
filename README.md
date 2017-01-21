@@ -133,6 +133,11 @@ Things that are awkward/weird/slow:
     this, but perhaps it's possible to merge several of these
     checks together in some cases.
 
+  * WASM requires that memory be little-endian, but TypedArrays
+    reflect the endianness of the underlying platform.  We feature-
+    detect endianness and fall back to using a DataView on big-
+    endian platforms.
+
 Things to do:
 
   * Enable soft-validation failures, for completeness.
