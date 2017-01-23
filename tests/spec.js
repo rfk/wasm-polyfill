@@ -3,12 +3,16 @@ const fs = require('fs')
 const path = require('path')
 const cp = require('child_process')
 
-var SPECDIR = path.resolve(__dirname, '..', 'spec', 'interpreter')
+var SPECDIR = path.resolve(__dirname, '..', 'spec')
+var SPECTESTDIR = path.resolve(__dirname, '..', 'spec', 'test', 'core')
 var CODEFILE = path.resolve(__dirname, '..', 'wasm-polyfill.min.js')
 
 describe('The WebAssembly polyfill', function() {
-  var TEST_FILES = fs.readdirSync(path.join(SPECDIR, 'test'))
+  var TEST_FILES = fs.readdirSync(SPECTESTDIR)
   TEST_FILES.forEach((function(filename) {
+    if (filename === 'soft-fail.wast') {
+      return
+    }
     if (path.extname(filename) === '.wast' && filename.indexOf('.fail.') === -1) {
       it('should pass the "' + path.basename(filename) + '" test suite',
         mkSpecTestRunner(filename)
@@ -22,8 +26,8 @@ function mkSpecTestRunner(filename) {
     // Use the spec interpreter to generate JS for the test.
     var testFile = path.join('/tmp', path.basename(filename) + '.js')
     var makeTestFile = ([
-       path.join(SPECDIR, 'wasm'),
-       '-d', path.join(SPECDIR, 'test', filename),
+       path.join(SPECDIR, 'interpreter', 'wasm'),
+       '-d', path.join(SPECTESTDIR, filename),
        '-o', testFile
     ]).join(' ')
     cp.exec(makeTestFile, function(err) {
@@ -32,17 +36,34 @@ function mkSpecTestRunner(filename) {
       // Fix up some ES6-isms in the generated code,
       // to ensure we can actually run it.
       var testCode = fs.readFileSync(testFile).toString()
-      testCode = testCode.replace("print: print || ((...xs) => console.log(...xs))", "print: print")
+      testCode = testCode.replace("print: print || ((...xs) => console.log(...xs))", "print: _print")
       testCode = testCode.replace(
         "function instance(bytes, imports = registry) {",
         "function instance(bytes, imports) {\n" +
         "  if (typeof imports === 'undefined') { imports = registry }"
       )
+      testCode = testCode.replace(
+        "function module(bytes, valid = true) {",
+        "function module(bytes, valid) {\n" +
+        "  if (typeof valid === 'undefined') { valid = true }"
+      )
 
       // Add hooks to make it correctly call the polyfill.
       testCode = testCode.replace("soft_validate = true", "soft_validate = false")
       testCode = "'use strict';\n" +
-                 fs.readFileSync(CODEFILE) + "\n" +
+                 "if (typeof require !== 'undefined') {\n" +
+                 "  var WebAssembly = require('" + CODEFILE + "')\n" +
+                 "} else if (typeof load !== 'undefined') {\n" +
+                 "  load('" + CODEFILE + "')\n" +
+                 "}\n" +
+                 "var _print = function() { print.apply(this, arguments); }\n" +
+                 "if (typeof module !== 'undefined') {" +
+                 "  _print = function() {\n" +
+                 "    for (var i = 0; i < arguments.length; i++) {\n" +
+                 "      console.log(arguments[i])\n" +
+                 "    }\n" +
+                 "  }\n" +
+                 "}\n" +
                  testCode
       fs.writeFileSync(testFile, testCode)
 
@@ -56,7 +77,7 @@ function mkSpecTestRunner(filename) {
       proc.on('exit', function(code, signal) {
         if (code || signal) { return done(code || signal) }
         var expectedOutput = null
-        var expectedOutputFile = path.join(SPECDIR, 'test', 'expected-output', filename + '.log')
+        var expectedOutputFile = path.join(SPECTESTDIR, 'expected-output', filename + '.log')
         if (fs.existsSync(expectedOutputFile)) {
           expectedOutput = fs.readFileSync(expectedOutputFile).toString()
         }
