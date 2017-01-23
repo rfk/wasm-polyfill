@@ -2,8 +2,11 @@
 .PHONY: all
 all: wasm-polyfill.min.js webextension
 
-wasm-polyfill.min.js: src/*.js src/translate/*.js node_modules/long/package.json
+# This uses rollup to make a single-file bundle,
+# then lightly hacks it to avoid clobbering an existing WebAssembly global.
+wasm-polyfill.min.js: src/*.js src/translate/*.js node_modules/long/package.json rollup.config.js
 	./node_modules/.bin/rollup -c
+	sed -i '' 's/\([a-z][a-z]*\)\.WebAssembly *= *\([a-z][a-z]*\)()/\1.WebAssembly=\1.WebAssembly||\2()/g' wasm-polyfill.min.js
 
 spec/interpreter/README.md:
 	git submodule update --init

@@ -8,13 +8,12 @@ export default {
   entry: 'src/index.js',
   dest: 'wasm-polyfill.min.js',
   format: 'umd',
-  noConflict: true,
   plugins: [
     nodeResolve({
       module: true,
       browser: true
     }),
     commonjs(),
-//    uglify()
+    uglify()
   ]
 }

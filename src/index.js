@@ -23,7 +23,6 @@ import { compileAsync, compileSync} from "./compile"
 import { CompileError, LinkError, RuntimeError } from "./errors"
 import { dump, _toBoxedNaN } from "./utils"
 
-
 export default WebAssembly
 
 var WebAssembly = {
