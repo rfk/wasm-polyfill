@@ -80,7 +80,7 @@ Next, make sure you've built it into a standalone JS file::
 
 Then you can load it into a webpage like this:
 
-```
+```xml
 <script type="text/javascript" src="./wasm-polyfill.min.js"></script>
 <script type="text/javascript">
 // This uses the browser's builtin WebAssembly if present,
@@ -91,7 +91,7 @@ var funcs = WebAssembly.instantiate("wasm code here")
 
 Or load it as a module in node:
 
-```
+```javascript
 var WebAssembly = require('wasm-polyfill.min.js')
 var funcs = WebAssembly.instantiate("wasm code here")
 ```
@@ -133,7 +133,7 @@ days for this code! :-)
 As a concrete example, given this simple WebAssembly implementation of a
 32-bit factorial function:
 
-```
+```lisp
 (module
   (func (export "fac-rec") (param i64) (result i64)
     (if i64 (i64.eq (get_local 0) (i64.const 0))
@@ -146,7 +146,7 @@ As a concrete example, given this simple WebAssembly implementation of a
 
 The polyfill will produce a JavaScript function that looks like:
 
-```
+```javascript
 function (WebAssembly, asmlib, imports) {
   
   // Create and annotate the exported functions.
